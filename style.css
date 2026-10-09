@@ -402,3 +402,18 @@ ul.plain li { margin: 3px 0; }
 .qt td { white-space: nowrap; }
 .calc .sym { margin-top: 6px; }
 @media (max-width: 699px) { .detail { overscroll-behavior: contain; } .more-row .btn { padding: 3px 10px; } }
+
+/* ---- live / example mode bar and key panel */
+.modes { display: flex; gap: 0; margin-bottom: 8px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.mode-btn { flex: 1 1 0; border: 0; background: #fff; padding: 8px 10px; font: inherit; font-weight: 600; cursor: pointer; color: #34414f; }
+.mode-btn + .mode-btn { border-left: 1px solid var(--line); }
+.mode-btn.on { background: #243447; color: #fff; }
+.mode-btn:focus-visible { outline: 3px solid #4a90d9; outline-offset: -3px; }
+.bus.live .live-extra { justify-content: flex-start; color: #34414f; }
+.live-note { margin-top: 8px; color: var(--muted); }
+.live-err { background: var(--warnbg); color: var(--warn); }
+.rt-empty .btn { margin-top: 6px; }
+.key-row { display: flex; gap: 8px; margin: 6px 0; }
+.key-row input { flex: 1 1 auto; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font: inherit; }
+.key-rem { display: block; margin: 4px 0; font-size: 14px; }
+#key-panel .btn { margin-top: 6px; }

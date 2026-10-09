@@ -1,6 +1,7 @@
-/* TAGOPA — 광역버스 승차 여유 예측 (체험용 프로토타입)
- * 하단 표: 정류장 × 대표 운행편, 칸 = 대표 시각 + 2×2 네 분류. 카드: 체험 상황(출근·퇴근)의 첫 번째·두 번째 버스. 체험용 도착정보는 과거 GBIS 기록 하루(2026-10-06)를 그대로 재생한 것이며 실제 현재 정보가 아니다.
- * 자료: data/app/recent/ (meta → 인덱스 → 유형별 격자 → 슬롯별 상세, trial.json 재생 기록, operating_day.json 운행일 기준). 외부 API·인증키·서버를 사용하지 않는다. */
+/* TAGOPA — 광역버스 승차 여유 예측
+ * 하단 표: 정류장 × 대표 운행편, 칸 = 대표 시각 + 2×2 네 분류. 카드: 두 가지 보기 — ① 실시간 조회(경기도 공식 버스도착정보 API를 브라우저에서 직접 호출, 사용자가 입력한 Decoding 키) ② 예시 보기(가상 출근·퇴근 시나리오).
+ * 실시간 빈자리는 조회 시점 차내 빈자리이며 하단 표의 예상 승차 여유(과거 기록 기반)와 다른 값이다. 실시간 차량을 과거 대표편에 연결하지 않는다.
+ * 자료: data/app/recent/ (meta → 인덱스 → 유형별 격자 → 슬롯별 상세, trial.json 예시 시나리오, operating_day.json 운행일 기준). 서버·프록시 없음. 인증키는 코드·자료·콘솔에 두지 않는다. */
 (function () {
   'use strict';
 
@@ -31,9 +32,15 @@
     meta: null, route: 'M4130', dir: 'down', stop: null, type: 'normal_weekday', showAll: false, showIncomplete: false, showMore: false,
     hl: null, banner: null, detail: null, detailOpen: false, trigger: null, focusClose: false, popStop: null, loadErr: null, loaded: [],
     dev: { on: false, caseId: 'A', fixtures: null }, buses: null, busesAt: null,
-    trial: { id: 'commute_am', custom: false }
+    trial: { id: 'commute_am', custom: false },
+    mode: 'example', live: { status: 'idle', tok: 0, buses: [], flag: '', at: '', why: '' }
   };
   var TRIAL = null, OPDAY = null;
+  // ---- real-time arrival (official Gyeonggi bus-arrival API v2, item lookup). The key lives only in this variable (and, if the user asks for it, localStorage).
+  var API_URL = 'https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalItemv2';
+  var ROUTE_IDS = { M4130: '234001577', M4137: '234001622' };   // GBIS routeId (verified against the stored routeStations responses); stationId and staOrder come from meta.json
+  var LS_KEY = 'tagopa.apikey', apiKey = null, liveTimer = null;
+  var LOWPLATE = { 0: '일반버스', 1: '저상버스', 2: '2층버스', 5: '전세버스', 6: '예약버스', 7: '트롤리' };   // official code list; unlisted values are not shown
   var DOW_DATE = { '월': '2026-09-28', '화': '2026-10-06', '수': '2026-09-30', '목': '2026-10-01', '금': '2026-10-02', '토': '2026-10-10', '일': '2026-10-04' };   // calendar dates used only to place a development weekday on the calendar
   var cache = { index: {}, grid: {}, detail: {}, pending: {} };
 
@@ -58,7 +65,9 @@
     return null;
   }
 
+  function kstNow() { var d = new Date(Date.now() + 9 * 3600000), iso = d.toISOString(); return { date: iso.slice(0, 10), minutes: d.getUTCHours() * 60 + d.getUTCMinutes(), sec: d.getUTCSeconds(), wd: (d.getUTCDay() + 6) % 7 }; }
   function now() {
+    if (state.mode === 'live') { var k = kstNow(); return { wd: k.wd, minutes: k.minutes, date: k.date, fake: false }; }
     if (state.dev.on && state.dev.fixtures) {
       var c = caseById(state.dev.caseId);
       return { wd: WD.indexOf(c.now.weekday), minutes: hm2m(c.now.hhmm), date: DOW_DATE[c.now.weekday], fake: true };
@@ -160,6 +169,7 @@
   }
   function refreshBuses() {
     state.hl = null;
+    if (state.mode === 'live') { state.buses = null; state.busesAt = null; liveSchedule(); return; }
     if (state.dev.on && state.dev.fixtures) {
       var c = caseById(state.dev.caseId), nI = now();
       state.buses = c.buses.map(function (b, i) { return { idx: i + 1, minutes: b.minutes, seats: b.seats, op: resolveOperatingDay(b, nI) }; });
@@ -225,6 +235,107 @@
     return '<div class="bus-guide' + qc + '"><div class="gl1">예상 승차 여유 약 <b>' + n + '명</b>' + deck + '</div></div>';
   }
 
+  // ---------------------------------------------------------------- live lookup (one call per explicit user action; no automatic repetition)
+  function lsGet() { try { return window.localStorage.getItem(LS_KEY); } catch (e) { return null; } }
+  function lsSet(v) { try { if (v == null) window.localStorage.removeItem(LS_KEY); else window.localStorage.setItem(LS_KEY, v); return true; } catch (e) { return false; } }
+  function toN(v) { return (v === '' || v == null || isNaN(Number(v))) ? null : Number(v); }
+  function liveSchedule() {
+    clearTimeout(liveTimer);
+    var tok = ++state.live.tok;
+    if (!apiKey) { state.live = { status: 'nokey', tok: tok, buses: [], flag: '', at: '', why: '' }; return; }
+    state.live = { status: 'loading', tok: tok, buses: [], flag: '', at: '', why: '' };
+    liveTimer = setTimeout(liveQuery, 450);   // a short wait so that several quick stop changes make one call
+  }
+  function liveFail(tok, why) {
+    if (tok !== state.live.tok) return;
+    state.live = { status: 'error', tok: tok, buses: [], flag: '', at: '', why: why };
+    renderCard();
+  }
+  function liveQuery() {
+    var tok = state.live.tok, st = stopByOrder(state.stop), rid = ROUTE_IDS[state.route];
+    if (!apiKey || !st || !rid) { liveFail(tok, '조회할 정류장 정보를 찾지 못했어요.'); return; }
+    var qs = new URLSearchParams({ format: 'json', serviceKey: apiKey, stationId: String(st.id), routeId: rid, staOrder: String(state.stop) });   // the raw (Decoding) key is encoded exactly once here
+    fetch(API_URL + '?' + qs.toString(), { cache: 'no-store', credentials: 'omit' }).then(function (r) {
+      return r.text().then(function (t) { return { status: r.status, text: t }; });
+    }).then(function (x) {
+      if (tok !== state.live.tok) return;
+      var p = liveParse(x.status, x.text);
+      if (p.kind === 'ok' || p.kind === 'none') {
+        var k = kstNow();
+        state.live = { status: p.kind, tok: tok, buses: p.buses || [], flag: p.flag || '', at: pad(Math.floor(k.minutes / 60)) + ':' + pad(k.minutes % 60) + ':' + pad(k.sec), atMin: k.minutes, why: '' };
+        renderCard();
+      } else liveFail(tok, p.why);
+    }, function () { liveFail(tok, '연결에 실패했어요. 네트워크 상태를 확인해 주세요. 브라우저가 요청을 막았을 수도 있어요.'); });
+  }
+  function liveParse(httpStatus, text) {
+    var j; try { j = JSON.parse(text); } catch (e) { return { kind: 'err', why: '응답을 읽지 못했어요(HTTP ' + httpStatus + ').' }; }
+    var g = j && j.OpenAPI_ServiceResponse && j.OpenAPI_ServiceResponse.cmmMsgHeader;
+    if (g) {
+      var c = String(g.returnReasonCode);
+      if (c === '22') return { kind: 'err', why: '오늘 호출 한도를 넘었어요. 내일 다시 시도해 주세요.' };
+      if (c === '23') return { kind: 'err', why: '짧은 시간에 요청이 많았어요. 잠시 뒤 다시 눌러 주세요.' };
+      if (c === '20' || c === '30' || c === '31' || c === '32') return { kind: 'err', why: '인증키를 확인해 주세요. Decoding(원본키)인지, 사용 신청이 승인됐는지 확인해 보세요. (오류 코드 ' + c + ')' };
+      return { kind: 'err', why: '조회하지 못했어요. (오류 코드 ' + c + ')' };
+    }
+    var r = j && j.response, h = r && r.msgHeader;
+    if (!h) return { kind: 'err', why: '예상하지 못한 응답 형식이에요(HTTP ' + httpStatus + ').' };
+    var rc = toN(h.resultCode);
+    if (rc === 4) return { kind: 'none', buses: [], flag: '' };
+    if (rc !== 0) return { kind: 'err', why: '조회하지 못했어요. (결과 코드 ' + esc(String(h.resultCode)) + ')' };
+    var it = r.msgBody && r.msgBody.busArrivalItem;
+    if (Array.isArray(it)) it = it[0];
+    if (!it) return { kind: 'none', buses: [], flag: '' };
+    var buses = [];
+    [1, 2].forEach(function (i) {
+      var pt = toN(it['predictTime' + i]), ps = toN(it['predictTimeSec' + i]);
+      if (pt == null && ps == null) return;
+      var min = pt != null ? pt : Math.ceil(ps / 60);
+      buses.push({ idx: buses.length + 1, minutes: min, sec: ps, seats: toN(it['remainSeatCnt' + i]), loc: toN(it['locationNo' + i]), low: toN(it['lowPlate' + i]) });
+    });
+    var flag = it.flag == null ? '' : String(it.flag);
+    return { kind: buses.length ? 'ok' : 'none', buses: buses, flag: flag };
+  }
+  function liveBusHtml(b) {
+    var names = ['첫 번째 버스', '두 번째 버스'], k = kstNow(), arr = (state.live.atMin != null ? state.live.atMin : k.minutes) + b.minutes;
+    var eta = b.minutes <= 0 || (b.sec != null && b.sec < 60) ? '곧 도착' : b.minutes + '분 후';
+    var seats = (b.seats == null || b.seats < 0) ? '<span class="small">빈자리 정보 없음</span>' : '현재 빈자리 <b>' + b.seats + '석</b>';
+    var extra = [];
+    if (b.loc != null && b.loc >= 0) extra.push(b.loc === 0 ? '이 정류장 도착' : b.loc + '정류장 전');
+    if (b.low != null && LOWPLATE[b.low]) extra.push(LOWPLATE[b.low]);
+    return '<div class="bus live" data-bus="' + b.idx + '"><div class="bus-head"><span>' + (b.idx === 1 ? '①' : '②') + ' ' + names[b.idx - 1] + ' · <b>' + eta + '</b> <span class="eta">(' + hm(arr % 1440) + '경 도착 예정)</span></span></div>' +
+      '<div class="bus-obs">' + seats + (b.seats != null && b.seats >= 0 ? ' <span class="small">· ' + esc(state.live.at.slice(0, 5)) + ' 조회 기준</span>' : '') + '</div>' +
+      (extra.length ? '<div class="bus-ref live-extra">' + esc(extra.join(' · ')) + '</div>' : '') + '</div>';
+  }
+  function liveBodyHtml() {
+    var L = state.live;
+    if (L.status === 'nokey') return '<div class="rt-empty">실시간 조회에는 인증키가 필요해요. <button type="button" class="btn primary" data-act="open-key">인증키 입력</button><div class="small">키 없이는 \'예시 보기\'를 이용할 수 있어요.</div></div>';
+    if (L.status === 'loading' || L.status === 'idle') return '<div class="rt-empty">조회 중…</div>';
+    if (L.status === 'error') return '<div class="rt-empty live-err" role="alert"><b>조회하지 못했어요.</b><br>' + esc(L.why) + '<div><button type="button" class="btn" data-act="refresh">다시 조회</button></div></div>';
+    var h = '';
+    if (L.status === 'none' || !L.buses.length) {
+      var fl = L.flag === 'STOP' ? ' <span class="small">(운행 종료 상태)</span>' : (L.flag === 'WAIT' ? ' <span class="small">(회차 대기 중)</span>' : '');
+      return '<div class="rt-empty">현재 도착 예정 버스가 없습니다.' + fl + '</div>';
+    }
+    h = L.buses.map(liveBusHtml).join('');
+    return h + '<div class="small live-note">현재 빈자리는 조회한 시점의 이 버스 값이에요. 아래 시간표의 예상 승차 여유는 과거 기록으로 계산한 값으로 서로 달라요.</div>';
+  }
+  function modeBarHtml() {
+    return '<div class="modes" role="tablist" aria-label="보기 방식">' + [['live', '실시간 조회'], ['example', '예시 보기']].map(function (m) {
+      return '<button type="button" role="tab" class="mode-btn' + (state.mode === m[0] ? ' on' : '') + '" data-mode="' + m[0] + '" aria-selected="' + (state.mode === m[0]) + '">' + m[1] + '</button>';
+    }).join('') + '</div>';
+  }
+  function liveMetaHtml() {
+    var L = state.live, busy = L.status === 'loading';
+    var t = L.at ? '마지막 조회 ' + esc(L.at) : (busy ? '조회 중…' : '아직 조회하지 않았어요');
+    return '<div class="trial-meta"><span>공식 도착정보 · ' + t + '</span>' + (apiKey ? '<button type="button" class="btn" data-act="refresh"' + (busy ? ' disabled' : '') + '>새로고침</button>' : '') + '</div>';
+  }
+  function setMode(m) {
+    if (m === state.mode) return;
+    state.mode = m;
+    if (m === 'example') { selectScenario(state.trial.id); return; }
+    state.banner = null; state.detail = null; state.detailOpen = false; refreshBuses(); renderCard(); renderStats(); renderDetail();
+  }
+
   // ---------------------------------------------------------------- controls
   function renderControls() {
     $('#sel-route').innerHTML = state.meta.routes.map(function (r) { return '<option value="' + r.id + '"' + (r.id === state.route ? ' selected' : '') + '>' + r.id + '</option>'; }).join('');
@@ -245,26 +356,27 @@
   }
   function scenarioBarHtml() {
     var sc = scenarioById(state.trial.id), nI = now();
-    var h = '<div class="scen" role="group" aria-label="체험 상황 선택">' + TRIAL.scenarios.map(function (x) {
+    var h = '<div class="scen" role="group" aria-label="예시 상황 선택">' + TRIAL.scenarios.map(function (x) {
       var on = x.id === state.trial.id && !state.trial.custom;
-      return '<button type="button" class="scen-btn' + (on ? ' on' : '') + '" data-scen="' + x.id + '" aria-pressed="' + on + '"><b>' + esc(x.label) + '</b><span>' + esc(x.sub).replace(' · ', '<br>') + '</span></button>';
+      return '<button type="button" class="scen-btn' + (on ? ' on' : '') + '" data-scen="' + x.id + '" aria-pressed="' + on + '"><b>' + esc(String(x.label).replace(/ 체험$/, ' 예시')) + '</b><span>' + esc(x.sub).replace(' · ', '<br>') + '</span></button>';
     }).join('') + '</div>';
-    return h + '<div class="trial-meta"><span class="pill-demo">시연용 예시</span> <span>' + TYPE_LABEL[typeOfWd(TRIAL.weekday)] + ' ' + esc(sc.now) + ' 기준 · 체험용 도착정보</span></div>';
+    return h + '<div class="trial-meta"><span class="pill-demo">가상 예시</span> <span>' + TYPE_LABEL[typeOfWd(TRIAL.weekday)] + ' ' + esc(sc.now) + ' 기준 도착정보</span></div>';
   }
   function renderCard() {
-    var el = $('#card'), s = stopByOrder(state.stop);
+    var el = $('#card'), s = stopByOrder(state.stop), live = state.mode === 'live';
     var head = '<div class="card-head"><div><h2>다가오는 버스</h2><div class="sub">' + esc(state.route) + ' ' + esc(dirLabel(state.dir)) + ' · ' + esc(s ? s.name : '') + '</div></div></div>';
     var banner = '', buses = '';
-    if (!state.buses || !state.buses.length) buses = '<div class="rt-empty">이 정류장에는 체험 도착정보가 없어요. 다른 정류장을 선택해 보세요.</div>';
+    if (live) buses = liveBodyHtml();
+    else if (!state.buses || !state.buses.length) buses = '<div class="rt-empty">이 정류장에는 예시 도착정보가 없어요. 다른 정류장을 선택해 보세요.</div>';
     else buses = state.buses.map(busHtml).join('');
-    el.innerHTML = scenarioBarHtml() + head + banner + '<div class="rt-wrap"><div class="rt-buses">' + buses + '</div>' + stopListHtml() + '</div>';
+    el.innerHTML = modeBarHtml() + (live ? liveMetaHtml() : scenarioBarHtml()) + head + banner + '<div class="rt-wrap"><div class="rt-buses">' + buses + '</div>' + stopListHtml() + '</div>';
     var sl = el.querySelector('.stoplist li.sel'), ol = el.querySelector('.stoplist ol');
     if (sl && ol && ol.scrollHeight > ol.clientHeight) ol.scrollTop = Math.max(0, ol.scrollTop + (sl.getBoundingClientRect().top - ol.getBoundingClientRect().top) - ol.clientHeight / 2 + sl.offsetHeight / 2);
   }
   function busHtml(b) {
     var names = ['첫 번째 버스', '두 번째 버스'], o = b.op, link = connectBus(b);
     var h = '<div class="bus' + (link.kind === 'linked' && link.cls ? ' qa-' + link.cls : '') + '" data-bus="' + b.idx + '"><div class="bus-head"><span>' + (b.idx === 1 ? '①' : '②') + ' ' + names[b.idx - 1] + ' · <b>' + b.minutes + '분 후</b> <span class="eta">(' + o.hhmm + ' 도착 예정)</span></span></div>' +
-      '<div class="bus-obs">빈자리 <b>' + b.seats + '석</b> <span class="small">· 체험용</span></div>';
+      '<div class="bus-obs">예시 빈자리 <b>' + b.seats + '석</b></div>';
     if (link.kind === 'loading') h += '<div class="bus-guide none">불러오는 중…</div>';
     else if (link.kind === 'hold') h += '<div class="bus-guide none">참고할 과거 기록을 고르지 못했어요.<div class="small">' + esc(link.reason) + '</div></div>';
     else if (link.kind === 'none') h += '<div class="bus-guide none">참고할 과거 기록이 없어요.<div class="small">' + esc(link.reason) + '</div></div>';
@@ -529,13 +641,39 @@
     var sat = hasData('토') ? '공휴일이 아닌 토요일 기록 ' + typeDates('토').length + '일' : '공휴일이 아닌 토요일 기록은 아직 없어요';
     el.innerHTML =
       '<div class="panel"><button class="btn" id="btn-back">← 돌아가기</button><h2 style="margin-top:8px">설정·안내</h2></div>' +
-      '<div class="panel"><h2>서비스 소개</h2><p>과거 버스 기록으로 정류장별 승차 여유를 비교하는 체험용 서비스입니다.</p></div>' +
-      '<div class="panel"><h2>자료</h2><ul class="plain"><li>대상: ' + esc(routes) + ' (동탄→서울, 서울→동탄)</li><li>과거 기록: ' + esc(dates[0]) + ' ~ ' + esc(dates[dates.length - 1]) + '</li><li>체험용 도착정보는 가상 예시이며, 예상 승차 여유는 과거 기록 기반 시연용 추정입니다.</li>' +
+      '<div class="panel"><h2>서비스 소개</h2><p>과거 버스 기록으로 정류장별 승차 여유를 비교하고, 공식 도착정보로 지금 오는 버스를 확인하는 서비스입니다.</p></div>' +
+      keyPanelHtml() +
+      '<div class="panel"><h2>자료</h2><ul class="plain"><li>대상: ' + esc(routes) + ' (동탄→서울, 서울→동탄)</li><li>과거 기록: ' + esc(dates[0]) + ' ~ ' + esc(dates[dates.length - 1]) + '</li><li>예시 보기의 도착정보는 가상 예시이며, 예상 승차 여유는 과거 기록 기반 시연용 추정입니다.</li>' +
       '<li>승하차 인원 참고값: 경기도 공공데이터(공공데이터포털, 이용허락범위 제한 없음)를 가공했어요.</li><li>버스 도착·잔여석 기록: 경기버스정보(GBIS) 과거 도착정보를 가공한 시연용 자료예요.</li><li>배차 정보: 운수회사 배차표를 노선·차종 대응에 참고했어요.</li>' +
       '<li>요일별 기록: ' + esc(groups) + ' (요일마다 기록이 적어 참고용이에요)</li><li>일·공휴일은 공휴일과 일요일을 묶은 시연용 집계예요. ' + esc(sat) + '.</li></ul></div>' +
       '<div class="panel"><h2>계산 방법</h2>' + calcHtml() + '</div>' +
-      '<div class="panel"><h2>참고</h2><ul class="plain"><li>실제 현재 운행정보가 아닌 시연용 예시입니다.</li><li>예상값은 실제 탑승을 보장하지 않습니다.</li><li>자료 제공기관은 TAGOPA의 예상 결과와 무관하며 이를 보증하지 않습니다.</li><li>차량 정원과 승하차 인원은 시연용 가정이에요.</li></ul></div>' +
+      '<div class="panel"><h2>참고</h2><ul class="plain"><li>\'예시 보기\'의 도착정보는 가상 시나리오이고, \'실시간 조회\'는 경기도 버스도착정보 API의 응답입니다.</li><li>예상값은 실제 탑승을 보장하지 않습니다.</li><li>자료 제공기관은 TAGOPA의 예상 결과와 무관하며 이를 보증하지 않습니다.</li><li>차량 정원과 승하차 인원은 시연용 가정이에요.</li></ul></div>' +
       '';
+  }
+  function keyPanelHtml() {
+    var stored = lsGet() != null;
+    return '<div class="panel" id="key-panel"><h2>실시간 조회 인증키</h2>' +
+      '<p class="small">공공데이터포털에서 발급받은 <b>Decoding(원본키)</b>을 입력하세요. (경기도_버스도착정보 조회 서비스, 무료 · 하루 1,000회)</p>' +
+      '<div class="key-row"><input type="password" id="inp-key" autocomplete="off" spellcheck="false" placeholder="Decoding 인증키" aria-label="인증키"><button type="button" class="btn primary" id="btn-key-apply">사용</button></div>' +
+      '<label class="key-rem"><input type="checkbox" id="chk-remember"' + (stored ? ' checked' : '') + '> 이 브라우저에 기억하기</label>' +
+      '<div class="small" id="key-msg" role="status">' + (apiKey ? (stored ? '키를 사용 중이에요(이 브라우저에 저장됨).' : '키를 사용 중이에요(이 페이지를 닫으면 지워져요).') : (stored ? '저장된 키가 있어요.' : '키가 없어요.')) + '</div>' +
+      (stored || apiKey ? '<button type="button" class="btn" id="btn-key-clear">' + (stored ? '저장된 키 삭제' : '키 지우기') + '</button>' : '') +
+      '<p class="small">기본은 이 페이지에서만 쓰고 저장하지 않아요. 기억하기를 고르면 이 브라우저의 localStorage에 저장돼요. 편의 기능일 뿐 안전한 비밀 저장소가 아니니 공용 기기에서는 쓰지 마세요. 키는 서버나 개발자에게 전송되지 않고 공식 API로만 전달돼요.</p></div>';
+  }
+  function applyKey() {
+    var inp = $('#inp-key'), msg = $('#key-msg'), v = (inp.value || '').trim();
+    inp.value = '';
+    if (!v) { msg.textContent = '키를 입력해 주세요.'; return; }
+    if (/\s/.test(v) || /%[0-9A-Fa-f]{2}/.test(v)) { msg.textContent = '인코딩된 키(Encoding)이거나 형식이 맞지 않아요. 공공데이터포털의 Decoding(원본키)을 입력해 주세요.'; return; }
+    apiKey = v;
+    if ($('#chk-remember').checked) { if (!lsSet(v)) msg.textContent = '브라우저가 저장을 막아 이 페이지에서만 사용해요.'; } else lsSet(null);
+    showSettings(false);
+    if (state.mode !== 'live') setMode('live'); else { refreshBuses(); renderCard(); }
+  }
+  function clearKey() {
+    apiKey = null; lsSet(null); clearTimeout(liveTimer);
+    renderSettings();
+    if (state.mode === 'live') { refreshBuses(); renderCard(); }
   }
 
   function showSettings(on) { $('#settings').hidden = !on; $('#main').hidden = on; if (on) renderSettings(); }
@@ -600,6 +738,15 @@
       renderStats(); renderDetail(); loadViewAndRender();
     });
     $('#card').addEventListener('click', function (e) {
+      var md = e.target.closest('[data-mode]');
+      if (md) { setMode(md.getAttribute('data-mode')); return; }
+      var ac = e.target.closest('[data-act]');
+      if (ac) {
+        var act = ac.getAttribute('data-act');
+        if (act === 'open-key') { showSettings(true); var kp = $('#key-panel'); if (kp && kp.scrollIntoView) kp.scrollIntoView(); }
+        if (act === 'refresh' && state.mode === 'live' && apiKey && state.live.status !== 'loading') { clearTimeout(liveTimer); state.live.status = 'loading'; state.live.tok++; renderCard(); liveQuery(); }
+        return;
+      }
       var sc = e.target.closest('[data-scen]');
       if (sc) { selectScenario(sc.getAttribute('data-scen')); return; }
       var sb = e.target.closest('.stop-btn');
@@ -625,7 +772,10 @@
     $('#settings').addEventListener('click', function (e) {
       var id = e.target.id;
       if (id === 'btn-back') showSettings(false);
+      if (id === 'btn-key-apply') applyKey();
+      if (id === 'btn-key-clear') clearKey();
     });
+    $('#settings').addEventListener('keydown', function (e) { if (e.key === 'Enter' && e.target.id === 'inp-key') { e.preventDefault(); applyKey(); } });
     $('#settings').addEventListener('change', function (e) {
     });
   }
@@ -642,6 +792,8 @@
       if (pr && meta.routes.some(function (r) { return r.id === pr; })) { state.route = pr; state.trial.custom = true; if (pd && routeMeta().directions.some(function (d) { return d.id === pd; })) state.dir = pd; else state.dir = routeMeta().directions[0].id; state.stop = defaultStop(); }
       if (ps && dirMeta().stops.indexOf(ps) >= 0) { state.stop = ps; }
       if (param('type') && TYPE_LABEL[param('type')]) state.type = param('type');
+      apiKey = lsGet();                                                    // only a key that the user chose to remember
+      if (apiKey && param('mode') !== 'example') { state.mode = 'live'; var tg = groupOfDate(kstNow().date); if (!param('type') && hasData(tg)) state.type = tg; }   // a remembered key opens the live view first
       refreshBuses();
       bind(); renderAll();
       return loadView().then(function () { renderStats(); renderCard(); scrollToDefault(); prefetchBusGrids(); });
