@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TAGOPA · 광역버스 승차 여유 예측</title>
+  <link rel="stylesheet" href="style.css?v=ea39069045">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23243447'/%3E%3Ctext x='16' y='22' font-size='17' font-family='sans-serif' font-weight='700' text-anchor='middle' fill='%23fff'%3ET%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+  <header class="top">
+    <h1>TAGOPA <small>광역버스 승차 여유 예측</small></h1>
+    <button id="btn-settings" class="icon-btn" aria-label="설정·안내">⚙ 설정·안내</button>
+  </header>
+
+  <main id="main">
+    <div class="page">
+      <section id="controls" class="panel" aria-label="노선·방향 선택">
+        <label>노선 <select id="sel-route"></select></label>
+        <label>방향 <select id="sel-dir"></select></label>
+      </section>
+
+      <section id="card" class="panel" aria-label="선택한 정류장의 도착 정보와 승차 여유 안내"></section>
+
+      <section id="stats" class="panel" aria-label="정류장 × 대표 운행편 시간표(최근 기록)">
+        <div id="types" class="types" role="tablist" aria-label="요일 선택"></div>
+        <div id="basis" class="basis"></div>
+        <div id="banner" class="banner" hidden></div>
+        <div id="colinfo" class="colinfo"></div>
+        <div class="grid-wrap"><div id="grid-scroll" class="grid-scroll" tabindex="0"><table id="grid"></table></div></div>
+        <div id="legend" class="legend"></div>
+      </section>
+
+      <aside id="detail" class="panel detail" aria-label="칸 상세"></aside>
+    </div>
+  </main>
+
+  <div id="scrim" class="scrim" hidden></div>
+  <section id="settings" class="settings" hidden></section>
+  <div id="popover" class="popover" hidden></div>
+
+  <script src="app.js?v=c6dbb246a4"></script>
+</body>
+</html>

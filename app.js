@@ -1,0 +1,660 @@
+/* TAGOPA — 광역버스 승차 여유 예측 (체험용 프로토타입)
+ * 하단 표: 정류장 × 대표 운행편, 칸 = 대표 시각 + 2×2 네 분류. 카드: 체험 상황(출근·퇴근)의 첫 번째·두 번째 버스. 체험용 도착정보는 과거 GBIS 기록 하루(2026-10-06)를 그대로 재생한 것이며 실제 현재 정보가 아니다.
+ * 자료: data/app/recent/ (meta → 인덱스 → 유형별 격자 → 슬롯별 상세, trial.json 재생 기록, operating_day.json 운행일 기준). 외부 API·인증키·서버를 사용하지 않는다. */
+(function () {
+  'use strict';
+
+  var WD = ['월', '화', '수', '목', '금', '토', '일'];
+  var BASE = 'data/app/recent/';
+  // state.type holds a DAY GROUP id: 월 화 수 목 금 토 일·공휴일 (each aggregated on its own dates; holidays only in 일·공휴일)
+  var TYPES = ['월', '화', '수', '목', '금', '토', '일·공휴일'];
+  var TYPE_LABEL = { '월': '월요일', '화': '화요일', '수': '수요일', '목': '목요일', '금': '금요일', '토': '토요일', '일·공휴일': '일·공휴일' };
+  function gType(g) { return g === '일·공휴일' ? 'holiday_block' : (g === '토' ? 'saturday' : 'normal_weekday'); }   // file family of a group (slot list is shared by 월~금)
+  var KLASS = { regular: '일반 정규편', charter_am: '출근 전세편(동탄·지정 출발 → 서울 편도)', charter_pm: '퇴근 전세편(서울 → 동탄 편도)', unconfirmed: '미확정 편' };
+  var KIND_TXT = { a: '도착형 시각', d: '출발형 시각', u: '시점 미판별 시각', arrival: '도착형 시각', departure: '출발형 시각', unclassified: '시점 미판별 시각' };
+  var QC = {
+    r: { name: '빠듯해요', short: '빨', def: '탈 자리가 적고, 사람들이 타면 거의 다 차는 편이에요. (승차 전 여유 R 중앙값 10명 미만, 그리고 승차 후 남는 자리 F가 4석 이하인 기록이 1/3 이상)' },
+    o: { name: '북적여요', short: '주', def: '탈 자리는 넉넉해도, 사람들이 타면 거의 다 차는 편이에요. (R 중앙값 10명 이상, F 4석 이하 기록이 1/3 이상)' },
+    y: { name: '조금 남아요', short: '노', def: '탈 자리는 적지만, 사람들이 타고도 조금 남는 편이에요. (R 중앙값 10명 미만, F 4석 이하 기록이 1/3 미만)' },
+    g: { name: '여유로워요', short: '초', def: '탈 자리가 넉넉하고, 사람들이 타고도 남는 편이에요. (R 중앙값 10명 이상, F 4석 이하 기록이 1/3 미만)' }
+  };
+  var QWHY = { F_missing: 'F(출발 후 잔여)가 없음', R_missing: 'R(합성 승차 전 여유)을 계산하지 않음', no_records: '기록 없음' };
+  var WHY = {
+    arrival_field_matches: '도착 시각 필드와 RArrivalDate가 같아 도착형으로 읽음 (시각 필드의 일치이며 잔여석을 잰 순간을 직접 확인한 것은 아님)',
+    origin_departure_only: '기점의 출발 시각만 있는 기록 → 출발형', confirmed_midstart_departure_only: '확인된 중간 출발편의 출발 시각 기록 → 출발형',
+    nonorigin_departure_only_not_promoted: '기점이 아닌 정류장의 출발 시각만 있는 기록: 미판별로 둠(자동으로 출발형이 되지 않음)',
+    time_fields_mismatch: '시각 필드가 서로 맞지 않아 미판별', remain_missing: '잔여석 값이 없어 미판별', no_time_field: '시각 필드가 없어 미판별', unclassified_combination: '미판별'
+  };
+  var CELL_SHORT = { not_target: '영업 대상 아님', beyond_last: '관측 구간 밖', before_seoul_start: '운행 안 함', not_operating: '운행 안 함', origin_record_missing: '기점 기록 누락', lead_gap: '기록 누락', trail_gap: '기록 누락', no_record: '기록 누락', start_missing_ms: '출발 기록 누락', trail_blocked: '이어지지 않음', beyond_turn: '회차 이후', beyond_last: '관측 밖', origin_unknown: '시작 위치 미확정', gap_before_first: '기록 누락', origin_missing_basis: '기점 기록 누락', slot_absent: '대응 없음' };
+
+  var state = {
+    meta: null, route: 'M4130', dir: 'down', stop: null, type: 'normal_weekday', showAll: false, showIncomplete: false, showMore: false,
+    hl: null, banner: null, detail: null, detailOpen: false, trigger: null, focusClose: false, popStop: null, loadErr: null, loaded: [],
+    dev: { on: false, caseId: 'A', fixtures: null }, buses: null, busesAt: null,
+    trial: { id: 'commute_am', custom: false }
+  };
+  var TRIAL = null, OPDAY = null;
+  var DOW_DATE = { '월': '2026-09-28', '화': '2026-10-06', '수': '2026-09-30', '목': '2026-10-01', '금': '2026-10-02', '토': '2026-10-10', '일': '2026-10-04' };   // calendar dates used only to place a development weekday on the calendar
+  var cache = { index: {}, grid: {}, detail: {}, pending: {} };
+
+  // ---------------------------------------------------------------- helpers
+  function $(s) { return document.querySelector(s); }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function hm(m) { m = Math.round(m); return pad(Math.floor(m / 60)) + ':' + pad(m % 60); }   // continuous clock: 24:15 = 00:15 of the next calendar day
+  function num(x, d) { return x == null ? '없음' : (Math.round(x * Math.pow(10, d || 0)) / Math.pow(10, d || 0)); }
+  function param(k) { var m = new RegExp('[?&]' + k + '=([^&]*)').exec(location.search); return m ? decodeURIComponent(m[1]) : null; }
+  function typeOfWd(wd) { var i = WD.indexOf(wd); return i < 0 ? '일·공휴일' : (i <= 5 ? WD[i] : '일·공휴일'); }
+  function hm2m(t) { var p = t.split(':'); return parseInt(p[0], 10) * 60 + parseInt(p[1], 10); }
+  function isoAdd(iso, n) { var d = new Date(iso + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
+  function isoDow(iso) { return (new Date(iso + 'T00:00:00Z').getUTCDay() + 6) % 7; }   // 0 = Monday
+  // ---- operating day (운행일): the day group belongs to the KD OPERATING day, not to the calendar date (data/analysis/2026-10_operating_day/README.md)
+  function dayClass(iso) { return (OPDAY.holidays[iso] || isoDow(iso) === 6) ? 'holiday' : 'normal'; }
+  function groupOfDate(iso) { if (OPDAY.holidays[iso] || isoDow(iso) === 6) return '일·공휴일'; return isoDow(iso) === 5 ? '토' : WD[isoDow(iso)]; }
+  function opDay(route, iso, t) {   // calendar date + minute of day of an arrival -> { date, cont, group } or null (undetermined)
+    var r = OPDAY.routes[route];
+    if (t >= r.first_dep[dayClass(iso)]) return { date: iso, cont: t, group: groupOfDate(iso) };
+    if (1440 + t <= r.latest_record_min) { var pv = isoAdd(iso, -1); return { date: pv, cont: 1440 + t, group: groupOfDate(pv) }; }
+    return null;
+  }
+
+  function now() {
+    if (state.dev.on && state.dev.fixtures) {
+      var c = caseById(state.dev.caseId);
+      return { wd: WD.indexOf(c.now.weekday), minutes: hm2m(c.now.hhmm), date: DOW_DATE[c.now.weekday], fake: true };
+    }
+    var sc = scenarioById(state.trial.id);
+    return { wd: WD.indexOf(TRIAL.weekday), minutes: hm2m(sc.now), date: TRIAL.date, fake: true };
+  }
+  function scenarioById(id) { return TRIAL.scenarios.filter(function (x) { return x.id === id; })[0]; }
+  function caseById(id) { return state.dev.fixtures.cases.filter(function (c) { return c.id === id; })[0]; }
+
+  // ---------------------------------------------------------------- data loading (split files; failures are shown, never replaced)
+  function fetchJson(url) {
+    return fetch(url, { cache: 'no-cache' }).then(function (r) {
+      if (!r.ok) throw new Error(url + ' → HTTP ' + r.status);
+      return r.text();
+    }).then(function (t) {
+      state.loaded.push({ url: url, bytes: new TextEncoder().encode(t).length });
+      return JSON.parse(t);
+    });
+  }
+  function once(bucket, key, url) {
+    if (cache[bucket][key]) return Promise.resolve(cache[bucket][key]);
+    if (cache.pending[bucket + key]) return cache.pending[bucket + key];
+    var p = fetchJson(url).then(function (j) { cache[bucket][key] = j; delete cache.pending[bucket + key]; return j; }, function (e) { delete cache.pending[bucket + key]; throw e; });
+    cache.pending[bucket + key] = p;
+    return p;
+  }
+  function ensureIndex(route, g) { return once('index', route + '|' + gType(g), BASE + 'index/' + route + '_' + gType(g) + '.json'); }
+  function ensureGrid(route, g) { return once('grid', route + '|' + g, BASE + 'grid/' + route + '_' + gType(g) + '_' + encodeURIComponent(g) + '.json'); }
+  function ensureDetail(file) { return once('detail', file, BASE + 'detail/' + encodeURIComponent(file) + '.json'); }
+  function getIndex(route, g) { return cache.index[(route || state.route) + '|' + gType(g || state.type)]; }
+  function getGrid(route, type) { return cache.grid[(route || state.route) + '|' + (type || state.type)]; }
+  function typeDates(g) { var x = state.meta.day_groups.filter(function (d) { return d.id === g; })[0]; return x ? x.dates : []; }
+  function hasData(type) { return typeDates(type).length > 0; }
+  function loadType(route, type) { if (!hasData(type)) return Promise.resolve(); return Promise.all([ensureIndex(route, type), ensureGrid(route, type)]); }
+  function loadView() { return loadType(state.route, state.type); }
+  function viewKey() { return [state.route, state.dir, state.type, state.stop].join('|'); }
+  function loadViewAndRender() { var my = viewKey(); return loadView().then(function () { if (my !== viewKey()) return; renderStats(); renderCard(); }).catch(showLoadError); }   // a late response never repaints a newer selection
+  function showLoadError(err) {
+    state.loadErr = err;
+    $('#grid').innerHTML = '';
+    $('#colinfo').innerHTML = '<div class="loaderr"><b>새 시간표 자료를 불러오지 못했습니다.</b><br>' + esc(err && err.message ? err.message : err) + '<br><span class="small">이전(2025-05 시험) 값으로 대체하지 않았습니다. 로컬 서버에서 열었는지 확인하세요.</span></div>';
+  }
+
+  // ---------------------------------------------------------------- route / direction / stops
+  function routeMeta() { return state.meta.routes.filter(function (r) { return r.id === state.route; })[0]; }
+  function dirMeta() { return routeMeta().directions.filter(function (d) { return d.id === state.dir; })[0]; }
+  function stopByOrder(o) { return state.meta.stops[state.route].filter(function (s) { return s.order === o; })[0]; }
+  function dirStops() { return dirMeta().stops.map(stopByOrder); }
+  function dirLabel(d) { return state.meta.directions[d].label; }
+  function defaultStop() { var l = dirMeta().stops; return l[Math.min(2, l.length - 1)]; }
+  function savePrefs() { /* nothing is stored in the browser */ }
+  function refStopName() { var r = state.meta.directions[state.dir].ref_stop[state.route], s = stopByOrder(r); return s ? s.name : ''; }
+
+  // ---------------------------------------------------------------- columns (one column = one representative run, the same for every stop row)
+  function isIncomplete(s, group, view) { return !!(s.hide && s.hide[group] && s.hide[group][view]); }
+  function viewSlots() {
+    var ix = getIndex(); if (!ix) return { shown: [], hidden: 0, applicable: 0, incomplete: 0 };
+    var view = state.dir;
+    var app = ix.slots.filter(function (s) { return s.sort && s.sort[view] && (!s.views || s.views.indexOf(view) >= 0); });   // a slot whose runs carry no boarding candidates in this direction is not listed at all (also not under 모두 보기)
+    var has = function (s) { return s.present && s.present[state.type] && s.present[state.type][view] > 0; };
+    var inc = function (s) { return has(s) && isIncomplete(s, state.type, view); };
+    var shown = app.filter(function (s) { return (state.showAll || has(s)) && (state.showIncomplete || !inc(s)); });
+    shown.sort(function (a, b) {
+      var x = a.sort[view].minute, y = b.sort[view].minute;
+      if (x == null && y == null) return 0; if (x == null) return 1; if (y == null) return -1; return x - y;
+    });
+    return { shown: shown, hidden: app.length - app.filter(has).length, applicable: app.length, incomplete: app.filter(inc).length };
+  }
+  function refText(s) {   // time at the SORT REFERENCE stop (not the selected stop)
+    var k = s.sort[state.dir];
+    if (k && k.basis && k.basis.indexOf('observed') === 0 && k.minute != null) return hm(k.minute) + '경';
+    return '없음';
+  }
+  function cellAt(slotId, type, order) { var g = getGrid(state.route, type || state.type); return g && g.slots[slotId] && g.slots[slotId][String(order)]; }
+  function selCell(slotId, type) { return cellAt(slotId, type, state.stop); }
+  function matchText(st) {
+    if (!st) return '';
+    if (st.indexOf('multi-date') === 0) return '여러 날짜 기록';
+    var m = /planned trip (\d\d:\d\d)/.exec(st);
+    if (st.indexOf('observed on 1 date; planned trip') === 0) return '1일만 관측 · 시간표(예정 ' + (m ? m[1] : '') + ') 근거 있음 · 다른 날짜와의 대응은 미확인';
+    if (st.indexOf('observed on 1 date; no planned') === 0) return '1일만 관측 · 본표에 없는 편(전세·중간 출발 등, 미확정)';
+    if (st.indexOf('correspondence unclear') === 0) return '날짜 간 대응 불명확 (8분 안에 후보가 있으나 서로 최선이 아님)';
+    if (st.indexOf('possible delay') === 0) return '지연 등 다른 원인 가능 (후보가 9~15분 떨어져 있어 합치지 않음)';
+    if (st.indexOf('observed only') === 0) return '1일만 관측 (15분 안에 호환되는 대표편 없음)';
+    return '관측 날짜 적음, 호환되는 대표편 없음';
+  }
+
+  // ---------------------------------------------------------------- real-time card (development fixture only)
+  function resolveOperatingDay(bus, nowI) {   // development fixtures: arrival = clock + minutes on the calendar; the operating day comes from the KD first / last trip rule
+    var total = nowI.minutes + bus.minutes, dayOff = Math.floor(total / 1440), arrMin = total % 1440, cal = isoAdd(nowI.date, dayOff);
+    var out = { hhmm: pad(Math.floor(arrMin / 60)) + ':' + pad(arrMin % 60), dayOff: dayOff, cal: cal };
+    if (bus.operatingDay) { out.known = true; out.wd = bus.operatingDay.weekday; out.group = typeOfWd(bus.operatingDay.weekday); out.hour = bus.operatingDay.hour; out.how = '시험용 운행일 확인값'; out.cont = bus.operatingDay.hour * 60 + (arrMin % 60); return out; }
+    var r = opDay(state.route, cal, arrMin);
+    if (!r) { out.known = false; out.reason = '소속 운행일을 판별할 근거가 없는 시각이에요.'; return out; }
+    out.known = true; out.date = r.date; out.group = r.group; out.wd = WD[isoDow(r.date)]; out.cont = r.cont; out.hour = Math.floor(r.cont / 60);
+    out.how = r.date === cal ? '그 날짜의 운행일' : '전날 운행일의 ' + Math.floor(r.cont / 60) + '시대';
+    return out;
+  }
+  function refreshBuses() {
+    state.hl = null;
+    if (state.dev.on && state.dev.fixtures) {
+      var c = caseById(state.dev.caseId), nI = now();
+      state.buses = c.buses.map(function (b, i) { return { idx: i + 1, minutes: b.minutes, seats: b.seats, op: resolveOperatingDay(b, nI) }; });
+      state.busesAt = hm(nI.minutes);
+      return;
+    }
+    if (!TRIAL) { state.buses = null; state.busesAt = null; return; }
+    // trial replay: the next two stored records of the replay date at THIS stop after the scenario clock (nothing is invented; another stop gets its own records)
+    var sc = scenarioById(state.trial.id), nm = hm2m(sc.now), lst = ((TRIAL.replay[state.route] || {})[state.dir] || {})[String(state.stop)] || [];
+    state.buses = lst.filter(function (x) { return x[0] > nm; }).slice(0, 2).map(function (x, i) {
+      var arr = Math.round(x[0]);
+      return { idx: i + 1, minutes: arr - nm, seats: x[1], op: { known: true, wd: TRIAL.weekday, group: typeOfWd(TRIAL.weekday), cont: x[0], hour: Math.floor(x[0] / 60), hhmm: hm(arr), how: '재생 기록의 원래 운행일' } };
+    });
+    state.busesAt = sc.now;
+  }
+  function loadFixtures() { return Promise.reject(new Error('disabled')); }
+  function setDev(on, caseId) {
+    if (!on) { state.dev.on = false; refreshBuses(); renderAll(); return Promise.resolve(); }
+    return loadFixtures().then(function () { state.dev.on = true; if (caseId) state.dev.caseId = caseId; refreshBuses(); renderAll(); prefetchBusGrids(); });
+  }
+  function prefetchBusGrids() {
+    if (!state.buses) return;
+    state.buses.forEach(function (b) {
+      if (!b.op.known) return;
+      var t = b.op.group || typeOfWd(b.op.wd);
+      if (hasData(t)) loadType(state.route, t).then(function () { renderCard(); }).catch(showLoadError);
+    });
+  }
+  // The past reference is NOT an identification of the same physical bus: it is the past representative run whose time AT THE SELECTED STOP is nearest to the expected arrival.
+  // Same route, same direction (view), same day type, the run must have an observed time at the selected stop. No distance limit; ties: more observed dates, earlier time, id.
+  function connectBus(b) {
+    var o = b.op;
+    if (!o.known) return { kind: 'hold', reason: o.reason };
+    var type = o.group || typeOfWd(o.wd);
+    if (!hasData(type)) return { kind: 'none', type: type, reason: type === '토' ? '이번 자료에는 공휴일이 아닌 토요일 기록이 없어요.' : '이 요일의 기록이 없어요.' };
+    var ix = getIndex(state.route, type), g = getGrid(state.route, type);
+    if (!ix || !g) return { kind: 'loading' };
+    var cands = [];
+    ix.slots.forEach(function (s) {
+      if (!s.sort || !s.sort[state.dir] || isIncomplete(s, type, state.dir)) return;
+      var c = g.slots[s.id] && g.slots[s.id][String(state.stop)];
+      if (!c || !c.t) return;
+      cands.push({ slot: s, cell: c, gap: c.t[1] - o.cont });
+    });
+    if (!cands.length) return { kind: 'none', type: type, reason: '이 정류장을 지나는 과거 대표편 기록이 없어요.' };
+    cands.sort(function (a, b) {
+      var d = Math.abs(a.gap) - Math.abs(b.gap); if (d) return d;
+      d = b.cell.t[2] - a.cell.t[2]; if (d) return d;
+      d = a.cell.t[1] - b.cell.t[1]; if (d) return d;
+      return a.slot.id < b.slot.id ? -1 : 1;
+    });
+    var best = cands[0], tie = cands.filter(function (c) { return Math.abs(c.gap) === Math.abs(best.gap); }).length > 1;
+    return { kind: 'linked', type: type, slot: best.slot, cell: best.cell, gap: best.gap, tie: tie, nCands: cands.length, cls: best.cell.q && best.cell.q[0] ? best.cell.q[0] : null };
+  }
+  // 줄 순서 안내: N = floor(R of the linked past run). A display rule, not a statistically verified safe lower bound.
+  function guidanceHtml(link) {
+    var r = link.cell && link.cell.r;
+    var qc = link.cls ? ' q-' + link.cls : '';   // the colour of the referenced timetable cell; neutral when that cell cannot be classified
+    if (!r) return '<div class="bus-guide none' + qc + '">예상 승차 여유 정보가 아직 없어요.</div>';
+    var deck = link.slot && link.slot.ref_C === 70 ? ' <span class="deck">2층 기준</span>' : '';
+    var n = Math.floor(r[0]);
+    if (n <= 0) return '<div class="bus-guide' + qc + '"><div class="gl1">예상 승차 여유 <b>' + (r[0] > 0 ? '1명 미만' : '0명') + '</b>' + deck + '</div></div>';
+    return '<div class="bus-guide' + qc + '"><div class="gl1">예상 승차 여유 약 <b>' + n + '명</b>' + deck + '</div></div>';
+  }
+
+  // ---------------------------------------------------------------- controls
+  function renderControls() {
+    $('#sel-route').innerHTML = state.meta.routes.map(function (r) { return '<option value="' + r.id + '"' + (r.id === state.route ? ' selected' : '') + '>' + r.id + '</option>'; }).join('');
+    $('#sel-dir').innerHTML = routeMeta().directions.map(function (d) { return '<option value="' + d.id + '"' + (d.id === state.dir ? ' selected' : '') + '>' + esc(d.label) + '</option>'; }).join('');
+  }
+  function stopListHtml() {
+    var list = dirStops();
+    var h = '<nav class="stoplist" aria-label="내 정류장 선택(노선 순서)"><div class="sl-title">내 정류장 <span class="small">탑승 후보 ' + list.length + '곳 · 노선 순서</span></div><ol>';
+    list.forEach(function (s, i) {
+      var sel = s.order === state.stop;
+      h += '<li class="' + (i === 0 ? 'first ' : '') + (i === list.length - 1 ? 'last ' : '') + (sel ? 'sel' : '') + '"><button type="button" class="stop-btn" data-stop="' + s.order + '" aria-pressed="' + sel + '">' +
+        '<span class="dot" aria-hidden="true"></span><span class="sn"><span class="nm">' + esc(s.name) + '</span><span class="meta">순서 ' + s.order + (s.turn ? ' · 회차' : '') + '</span></span></button></li>';
+    });
+    var nb = dirMeta().no_boarding || [];
+    if (nb.length) h += '</ol><div class="small nb-note">' + nb.map(function (x) { return esc(sname(x.order)) + '은(는) 승차 금지 정류장이라 승차 목록에서 뺐어요 <span class="small">(사용자 제공 운영 정보, 공식 확인 안 함)</span>'; }).join('<br>') + '</div></nav>';
+    else h += '</ol></nav>';
+    return h;
+  }
+  function scenarioBarHtml() {
+    var sc = scenarioById(state.trial.id), nI = now();
+    var h = '<div class="scen" role="group" aria-label="체험 상황 선택">' + TRIAL.scenarios.map(function (x) {
+      var on = x.id === state.trial.id && !state.trial.custom;
+      return '<button type="button" class="scen-btn' + (on ? ' on' : '') + '" data-scen="' + x.id + '" aria-pressed="' + on + '"><b>' + esc(x.label) + '</b><span>' + esc(x.sub).replace(' · ', '<br>') + '</span></button>';
+    }).join('') + '</div>';
+    return h + '<div class="trial-meta"><span class="pill-demo">시연용 예시</span> <span>' + TYPE_LABEL[typeOfWd(TRIAL.weekday)] + ' ' + esc(sc.now) + ' 기준 · 체험용 도착정보</span></div>';
+  }
+  function renderCard() {
+    var el = $('#card'), s = stopByOrder(state.stop);
+    var head = '<div class="card-head"><div><h2>다가오는 버스</h2><div class="sub">' + esc(state.route) + ' ' + esc(dirLabel(state.dir)) + ' · ' + esc(s ? s.name : '') + '</div></div></div>';
+    var banner = '', buses = '';
+    if (!state.buses || !state.buses.length) buses = '<div class="rt-empty">이 정류장에는 체험 도착정보가 없어요. 다른 정류장을 선택해 보세요.</div>';
+    else buses = state.buses.map(busHtml).join('');
+    el.innerHTML = scenarioBarHtml() + head + banner + '<div class="rt-wrap"><div class="rt-buses">' + buses + '</div>' + stopListHtml() + '</div>';
+    var sl = el.querySelector('.stoplist li.sel'), ol = el.querySelector('.stoplist ol');
+    if (sl && ol && ol.scrollHeight > ol.clientHeight) ol.scrollTop = Math.max(0, ol.scrollTop + (sl.getBoundingClientRect().top - ol.getBoundingClientRect().top) - ol.clientHeight / 2 + sl.offsetHeight / 2);
+  }
+  function busHtml(b) {
+    var names = ['첫 번째 버스', '두 번째 버스'], o = b.op, link = connectBus(b);
+    var h = '<div class="bus' + (link.kind === 'linked' && link.cls ? ' qa-' + link.cls : '') + '" data-bus="' + b.idx + '"><div class="bus-head"><span>' + (b.idx === 1 ? '①' : '②') + ' ' + names[b.idx - 1] + ' · <b>' + b.minutes + '분 후</b> <span class="eta">(' + o.hhmm + ' 도착 예정)</span></span></div>' +
+      '<div class="bus-obs">빈자리 <b>' + b.seats + '석</b> <span class="small">· 체험용</span></div>';
+    if (link.kind === 'loading') h += '<div class="bus-guide none">불러오는 중…</div>';
+    else if (link.kind === 'hold') h += '<div class="bus-guide none">참고할 과거 기록을 고르지 못했어요.<div class="small">' + esc(link.reason) + '</div></div>';
+    else if (link.kind === 'none') h += '<div class="bus-guide none">참고할 과거 기록이 없어요.<div class="small">' + esc(link.reason) + '</div></div>';
+    else h += guidanceHtml(link) + '<div class="bus-ref"><button class="btn primary bus-go" data-go="' + b.idx + '">시간표에서 보기 ▸</button></div>';
+    return h + '</div>';
+  }
+  function selectScenario(id) {
+    var sc = scenarioById(id);
+    state.trial = { id: id, custom: false };
+    state.route = sc.route; state.dir = sc.dir; state.stop = sc.stop; state.type = typeOfWd(TRIAL.weekday);
+    resetAfterSelectionChange(); renderAll();
+    return loadViewAndRender().then(function () { scrollToDefault(); prefetchBusGrids(); });
+  }
+  function goBus(idx) {
+    var b = state.buses.filter(function (x) { return x.idx === idx; })[0];
+    if (!b) return;
+    var link = connectBus(b);
+    if (link.kind === 'loading') { loadType(state.route, b.op.group || typeOfWd(b.op.wd)).then(function () { renderCard(); goBus(idx); }).catch(showLoadError); return; }
+    if (link.kind !== 'linked') return;
+    var prev = { type: state.type };
+    var changed = state.type !== link.type;
+    state.type = link.type;
+    state.banner = changed ? { text: '표를 ' + TYPE_LABEL[link.type] + ' 기준으로 바꿨어요. 위 카드는 그대로예요.', undo: prev } : null;
+    var my = viewKey();
+    var idxs = state.buses.filter(function (x) { var l = connectBus(x); return l.kind === 'linked' && l.slot.id === link.slot.id && l.type === link.type; }).map(function (x) { return x.idx; });
+    state.hl = { idxs: idxs, clicked: idx, slot: link.slot.id, stop: state.stop, type: link.type, route: state.route, dir: state.dir };
+    loadView().then(function () {
+      if (my !== viewKey()) return;
+      openDetail({ slot: link.slot.id, order: state.stop, type: link.type, fromBus: idx }, { k: 'bus', idx: idx });
+      renderStats(); renderDetail(); scrollToCell(link.slot.id, state.stop);
+    }).catch(showLoadError);
+  }
+
+  // ---------------------------------------------------------------- stats area
+  function renderTypes() {
+    $('#types').innerHTML = TYPES.map(function (t) {
+      var lab = t === '일·공휴일' ? '일·<small>공휴일</small>' : t;
+      return '<button class="seg" role="tab" data-type="' + t + '" aria-label="' + TYPE_LABEL[t] + '" aria-selected="' + (t === state.type) + '">' + lab + (hasData(t) ? '' : '<i class="soon" title="공휴일이 아닌 토요일 기록 없음"></i>') + '</button>';
+    }).join('');
+  }
+  function datesList(type) {
+    var info = state.meta.date_info;
+    return typeDates(type).map(function (d) { var x = info[d]; return d.slice(5) + ' ' + x.wd + (x.cls !== '정상 평일' ? '(' + x.cls + (x.name ? ' ' + x.name : '') + ')' : ''); }).join(' · ');
+  }
+  function renderBasis() {
+    var ds = typeDates(state.type);
+    $('#basis').innerHTML = ds.length ? '<b>' + TYPE_LABEL[state.type] + '</b> 최근 기록 ' + ds.length + '일 <details class="inl"><summary>날짜 보기</summary><div class="small">' + esc(datesList(state.type)) + '<br>' + esc(state.type === '일·공휴일' ? state.meta.types.holiday_block.note : '이 요일의 공휴일이 아닌 날짜만 쓰고 다른 요일과 섞지 않아요.') + '</div></details>' : '';
+  }
+  function renderBanner() {
+    var el = $('#banner');
+    if (!state.banner) { el.hidden = true; el.innerHTML = ''; return; }
+    el.hidden = false;
+    el.innerHTML = '<span>' + esc(state.banner.text) + '</span><button class="btn" id="btn-undo">이전 표(' + esc(TYPE_LABEL[state.banner.undo.type]) + ')로</button>';
+  }
+  function renderColInfo() {
+    var el = $('#colinfo');
+    if (!hasData(state.type)) {
+      el.innerHTML = '<div class="nodata-box"><b>정상 토요일 기록이 없어요.</b> 이번 자료에는 공휴일이 아닌 토요일이 없어요. 공휴일인 토요일은 \'일·공휴일\'에 들어 있고, 일반 토요일 기록처럼 보여주지 않아요.</div>';
+      return;
+    }
+    var vs = viewSlots(), more = '';
+    if (vs.hidden > 0 || vs.incomplete > 0) {
+      more = '<button type="button" class="btn more-btn" id="btn-more" aria-expanded="' + !!state.showMore + '">기록 더 보기 ' + (state.showMore ? '▴' : '▾') + '</button>';
+      if (state.showMore) {
+        more += '<div class="more-panel">' +
+          (vs.hidden > 0 ? '<div class="more-row"><span>기록이 부족한 편 <b>' + vs.hidden + '개</b></span><button type="button" class="btn" id="btn-showall">' + (state.showAll ? '숨기기' : '표시') + '</button></div>' : '') +
+          (vs.incomplete > 0 ? '<div class="more-row"><span>불완전 기록 <b>' + vs.incomplete + '개</b></span><button type="button" class="btn" id="btn-showinc">' + (state.showIncomplete ? '숨기기' : '확인하기') + '</button></div>' : '') + '</div>';
+      }
+    }
+    el.innerHTML = '<div class="cellnote">위: 대표 시각 · 괄호: 예상 승차 여유 · ＋: 보완값 사용</div>' + more;
+  }
+  function renderStats() { renderTypes(); renderBasis(); renderBanner(); renderColInfo(); renderGrid(); renderLegend(); }
+  function renderGrid() {
+    var tbl = $('#grid');
+    if (!hasData(state.type) || !getIndex() || !getGrid()) { tbl.innerHTML = ''; return; }
+    var vs = viewSlots(), stops = dirStops(), ndw = typeDates(state.type).length;
+    var h = '<thead><tr><th class="corner">정류장</th>';
+    vs.shown.forEach(function (s, i) {
+      var hl = state.hl && state.hl.slot === s.id && state.hl.type === state.type;
+      var c = selCell(s.id), st = c && c.t ? hm(c.t[1]) : (c && c.u && c.u[1] != null ? hm(c.u[1]) : '—');
+      h += '<th class="col' + (hl ? ' hl' : '') + '" data-slot="' + esc(s.id) + '" title="' + esc('이 정류장 대표 시각 ' + (c && c.t ? hm(c.t[1]) : '기록 없음')) + '">' +
+        '<span class="rt">' + esc(st) + '</span>' +
+        '<span class="bd">' + (s.kind === 'confirmed_midstart' ? '<i class="ms">중간출발 ' + esc(s.ms_text) + '</i>' : '') + (s.n_dates === 1 ? '<i class="one">1일만 관측</i>' : '') + (s.ref_C === 70 ? '<i class="deck">2층 기준</i>' : '') + '</span></th>';
+    });
+    h += '</tr></thead><tbody>';
+    stops.forEach(function (st) {
+      var mine = st.order === state.stop;
+      h += '<tr class="' + (mine ? 'mine' : '') + '" data-stop="' + st.order + '"><th class="stop" scope="row" data-stop="' + st.order + '"><span class="nm">' + (mine ? '▶ ' : '') + esc(st.name) + '</span><span class="ord">순서 ' + st.order + (st.turn ? ' · 회차' : '') + '</span></th>';
+      vs.shown.forEach(function (s) { h += cellHtml(s, st, ndw); });
+      h += '</tr>';
+    });
+    tbl.innerHTML = h + '</tbody>';
+  }
+  function peopleText(c) {   // second line of a cell and the card use the same R (median over the records that have R); R = 0 and 0 < R < 1 are different; missing is never 0
+    var r = c && c.r;
+    if (!r) return '(—)';
+    if (r[0] >= 1) return '(' + Math.floor(r[0]) + '명)';
+    return r[0] > 0 ? '(1명 미만)' : '(0명)';
+  }
+  var MODE_NOTE = { b: '인원·색: 이 요일에 기준 차종 기록이 없어 같은 배차 유형의 다른 날짜 기록 참고', n: '인원·색: 같은 운행의 앞뒤 기록으로 보완', c: '인원·색: 같은 정류장·배차 유형·차종에서 가장 가까운 시각의 다른 대표편 기록 참고', f: '일부 F는 CSV 참고 합성' };
+  function suppNote(c) {
+    var a = [];
+    if (!c.t && c.u && c.u[1] != null) a.push('시각: 시연용 보완(관측 없음)');
+    if (c.m && MODE_NOTE[c.m]) a.push(MODE_NOTE[c.m] + (c.bd && c.bd.length ? ' (' + c.bd.join(', ') + ')' : '') + (c.sr ? ' (' + (c.sr[0] ? c.sr[0] + ', 시각차 ' + c.sr[1] + '분, ' : '') + c.sr[2].join(', ') + ')' : ''));
+    if (c.fs && c.m !== 'f') a.push('일부 F는 CSV 참고 합성');
+    return a;
+  }
+  function cellHtml(s, st, ndw) {
+    var g = getGrid(), gs = g.slots[s.id], c = gs && gs[String(st.order)];
+    var sel = state.detail && state.detail.slot === s.id && state.detail.order === st.order && state.detail.type === state.type ? ' sel' : '';
+    var hl = state.hl && state.hl.slot === s.id && state.hl.stop === st.order && state.hl.type === state.type && state.hl.route === state.route && state.hl.dir === state.dir;
+    var mk = hl ? '<span class="mk">' + state.hl.idxs.map(function (i) { return i === 1 ? '①' : '②'; }).join('') + '</span>' : '';
+    var attrs = ' data-slot="' + esc(s.id) + '" data-stop="' + st.order + '"';
+    var q = c && c.q && c.q[0] ? c.q[0] : null;
+    var qcls = q ? ' q-' + q : '';
+    var qb = q ? '<b class="qb">' + QC[q].short + '</b>' : (c && c.q && (c.t || c.r) ? '<b class="qb na" title="분류 불가">불가</b>' : '');
+    var qtxt = q ? ' · ' + QC[q].name : (c && c.q ? ' · 분류 불가' : '');
+    var notes = c ? suppNote(c) : [];
+    var sp = notes.length ? '<b class="sp" title="' + esc(notes.join(' · ')) + '">＋</b>' : '';
+    var hasT = c && c.t, supT = c && !c.t && c.u && c.u[1] != null;
+    if (c && (hasT || supT || (c.r && c.q))) {
+      var k = hasT ? c.t[0] : 'a', main = hasT ? hm(c.t[1]) : (supT ? hm(c.u[1]) : '—');
+      var tag = k === 'u' ? '<i class="tg">?</i>' : '';
+      var marks = (c.c ? '<b class="mc" title="해석 주의 사례 포함">◆</b>' : '') + (c.p ? '<b class="mp" title="해석 주의 사례의 연결 기록">◇</b>' : '');
+      var title = st.name + ' ' + main + ' ' + peopleText(c).replace(/[()]/g, '') + qtxt + (notes.length ? ' · ＋ 보완값 포함' : '') + (c.c ? ' · ◆ 해석 주의' : '');
+      return '<td class="k-' + k + qcls + sel + (hl ? ' bus' : '') + '"' + attrs + ' title="' + esc(title) + '" aria-label="' + esc(title) + '">' + mk + marks + sp + '<span class="tm">' + main + tag + '</span><span class="sm pp">' + peopleText(c) + '</span>' + qb + '</td>';
+    }
+    var short = c ? shortStatus(c.s) : CELL_SHORT.slot_absent;
+    var tt = st.name + ' · ' + (c ? statusText(c.s) : '이 요일에는 이 대표편에 대응하는 운행 기록이 없어요') + qtxt;
+    return '<td class="st' + qcls + sel + '"' + attrs + ' title="' + esc(tt) + '" aria-label="' + esc(tt) + '">' + mk + sp + '<span class="sm">' + esc(short) + '</span>' + qb + '</td>';
+  }
+  function shortStatus(s) {
+    var order = ['before_seoul_start', 'not_operating', 'origin_record_missing', 'start_missing_ms', 'lead_gap', 'gap_before_first', 'trail_gap', 'no_record', 'trail_blocked', 'beyond_turn', 'beyond_last', 'origin_unknown', 'origin_missing_basis', 'beyond_last', 'not_target', 'slot_absent'];
+    for (var i = 0; i < order.length; i++) if (s[order[i]]) return CELL_SHORT[order[i]];
+    return '기록 없음';
+  }
+  // user-facing wording of a cell state. The internal codes are NOT merged: before_seoul_start (demonstration start chosen from the first observation; actual service unknown) and not_operating (designated mid-start run, evidenced) keep their own codes.
+  var STATUS_UX = {
+    before_seoul_start: ['운행 안 함', '시연상 운행하지 않는 구간으로 처리했어요. 실제 운행 여부는 미확인입니다.'],
+    not_operating: ['운행 안 함', '이 편은 이 정류장에서 운행하지 않아요(지정 중간 출발편).'],
+    not_target: ['영업 대상 아님', '이 방향에서는 승차 안내를 하지 않는 운행이에요.'],
+    beyond_last: ['관측 밖', '이 운행의 마지막 기록 이후라 값을 만들지 않았어요.'],
+    origin_unknown: ['시작 위치 미확정', '이 운행의 시작 위치를 알 수 없어 값을 만들지 않았어요.'],
+    gap_before_first: ['기록 없음', '이 정류장 기록이 없어요.'], lead_gap: ['기록 없음', '이 정류장 기록이 없어요.'], trail_gap: ['기록 없음', '이 정류장 기록이 없어요.'], no_record: ['기록 없음', '이 정류장 기록이 없어요.'],
+    origin_record_missing: ['기록 없음', '출발지 기록이 없어요.'], origin_missing_basis: ['기록 없음', '출발지 기록이 없어요.'], start_missing_ms: ['기록 없음', '출발 정류장 기록이 없어요.'],
+    trail_blocked: ['이어지지 않음', '기록이 이어지지 않는 운행 조각이에요.'], slot_absent: ['대응 없음', '이 요일에는 이 대표편에 해당하는 운행 기록이 없어요.']
+  };
+  function uxStatus(code) { var x = STATUS_UX[code]; return x ? x : [state.meta.status_codes[code] || code, '']; }
+  function statusText(s) { return Object.keys(s).filter(function (k) { return k !== 'rec'; }).map(function (k) { return uxStatus(k)[0]; }).filter(function (v, i, a) { return a.indexOf(v) === i; }).join(' · '); }
+  function scrollToCell(slotId, order) {
+    var sc = $('#grid-scroll'), td = document.querySelector('#grid td[data-slot="' + slotId + '"][data-stop="' + order + '"]');
+    if (!td) return;
+    var stopW = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--stopw'), 10) || 112;
+    var tr = td.getBoundingClientRect(), sr = sc.getBoundingClientRect();
+    sc.scrollLeft = Math.max(0, sc.scrollLeft + (tr.left - sr.left) - stopW - 8);
+    sc.scrollTop = Math.max(0, sc.scrollTop + (tr.top - sr.top) - 90);
+  }
+  function renderLegend() {
+    var sw = ['r', 'o', 'y', 'g'].map(function (k) { return '<div class="lg"><i class="sw q-' + k + '"></i><span><b>' + QC[k].name + '</b></span></div>'; }).join('');
+    $('#legend').innerHTML = '<div class="lgrid">' + sw + '</div><div class="lgnote">색: 과거 기록으로 나눈 분류</div>' +
+      '<details class="how"><summary>어떻게 계산했나요?</summary>' + calcHtml() + '</details>';
+  }
+  function calcHtml(evHtml) {   // the ONE explanation (below the table, in the cell detail and in 설정·안내); concept only, details stay in the analysis documents
+    var sw = function (k) { return '<span class="sw q-' + k + '"></span>' + QC[k].name; };
+    return '<div class="calc">' + (evHtml || '') +
+      '<div class="cs"><b>승차 여유 계산</b><p class="fm">R = V + A</p><p class="fm">F = R − B</p>' +
+      '<ul class="vars"><li><b>V</b> 도착 시 빈자리</li><li><b>A</b> 예상 하차 인원</li><li><b>B</b> 예상 승차 인원</li><li><b>R</b> 승차 전 여유</li><li><b>F</b> 승차 후 빈자리</li></ul>' +
+      '<p class="fd">A·B는 시연용 합성값이에요. 칸의 숫자는 R 중앙값(소수점 버림)이에요.</p></div>' +
+      '<div class="cs"><b>색상 분류</b><p class="fd">R 중앙값 10명 기준 · q = F가 4석 이하인 기록 비율 (경계 1/3)</p>' +
+      '<table class="qt"><thead><tr><th></th><th>q ≥ 1/3</th><th>q &lt; 1/3</th></tr></thead><tbody>' +
+      '<tr><th>R &lt; 10명</th><td>' + sw('r') + '</td><td>' + sw('y') + '</td></tr>' +
+      '<tr><th>R ≥ 10명</th><td>' + sw('o') + '</td><td>' + sw('g') + '</td></tr></tbody></table>' +
+      '<p class="fd">과거 기록을 이용한 시연용 분류이며 실제 탑승 확률은 아니에요.</p></div>' +
+      '<p class="fd sym">＋ 보완값 · ◆ 해석 주의 · 24 자정 이후 운행</p></div>';
+  }
+
+  // ---------------------------------------------------------------- detail (loaded per representative run, on demand)
+  function sname(o) { var x = stopByOrder(o); return x ? x.name : o + '번'; }
+  function isDesk() { return window.matchMedia('(min-width: 1000px)').matches; }
+  function syncScrim() { var sc = $('#scrim'); if (sc) sc.hidden = !(isDesk() && state.detail && state.detailOpen); }
+  function openDetail(det, trigger) { state.detail = det; state.detailOpen = true; state.trigger = trigger; state.focusClose = true; }
+  function restoreFocus() {
+    var t = state.trigger, el = null;
+    if (t) el = t.k === 'bus' ? document.querySelector('#card .bus-go[data-go="' + t.idx + '"]') : document.querySelector('#grid td[data-slot="' + t.slot + '"][data-stop="' + t.stop + '"]');
+    if (!el) return;
+    if (el.tagName === 'TD' && !el.hasAttribute('tabindex')) el.setAttribute('tabindex', '-1');
+    try { el.focus({ preventScroll: true }); } catch (e) { el.focus(); }
+  }
+  function closeDetail() {
+    if (!state.detail) return;
+    if (isDesk()) { state.detailOpen = false; renderDetail(); restoreFocus(); }      // desktop: the drawer slides away; the selected cell and the grid scroll position stay
+    else { state.detail = null; state.detailOpen = false; renderGrid(); renderDetail(); }   // phone: unchanged bottom-sheet behaviour
+  }
+  function fmtD(day) { var a = day.split('-'); return parseInt(a[1], 10) + '/' + parseInt(a[2], 10); }
+  function datesTxt(a) { return (a || []).map(fmtD).join(', '); }
+  function sameSet(a, b) { a = a || []; b = b || []; return a.length === b.length && a.every(function (x) { return b.indexOf(x) >= 0; }); }
+  function renderDetail() { renderDetailInner(); syncScrim(); }
+  function renderDetailInner() {
+    var el = $('#detail');
+    if (!state.detail) {
+      el.classList.remove('open');
+      el.innerHTML = '<div class="empty">표의 칸을 누르면 예상 승차 여유와 근거가 여기에 나와요.</div>';
+      return;
+    }
+    var d = state.detail, ix = getIndex(state.route, d.type), slot = ix && ix.slots.filter(function (s) { return s.id === d.slot; })[0];
+    el.classList.toggle('open', isDesk() ? !!state.detailOpen : true);
+    if (!slot) { el.innerHTML = '<button class="btn close" id="btn-close">닫기</button><div class="empty">' + (ix ? '이 칸의 정보를 찾지 못했어요.' : '불러오는 중…') + '</div>'; return; }
+    var cached = cache.detail[slot.file];
+    if (!cached) {
+      el.innerHTML = '<button class="btn close" id="btn-close">닫기</button><div class="empty">불러오는 중…</div>';
+      ensureDetail(slot.file).then(function () { if (state.detail === d) renderDetail(); }).catch(function (e) { el.innerHTML = '<button class="btn close" id="btn-close">닫기</button><div class="loaderr">' + esc(e.message) + '</div>'; });
+      return;
+    }
+    var st = stopByOrder(d.order), cell = cached.cells[String(d.order)], ds = typeDates(d.type), vs = viewSlots(), rank = vs.shown.indexOf(slot) + 1;
+    var agg = cell.wk[d.type], gc = cellAt(slot.id, d.type, d.order);
+    var hasT = gc && gc.t, tt = hasT ? hm(gc.t[1]) + (gc.t[0] === 'd' ? ' 출발' : '') : (gc && gc.u && gc.u[1] != null ? hm(gc.u[1]) : null);
+    var q = gc && gc.q && gc.q[0] ? gc.q : (agg && agg.q && agg.q[0] ? agg.q : (gc && gc.qs && gc.qs[0] ? gc.qs : null));
+    var r = gc && gc.r, ref = agg && agg.ref;
+    var h = '<button class="btn close" id="btn-close">닫기</button><h3><span class="h3n">' + esc(st.name) + '</span></h3><div class="dsub">' + esc(state.route) + ' · ' + TYPE_LABEL[d.type] + (tt ? ' <b>' + tt + '</b>' : '') + '</div>';
+    if (d.fromBus) h += '<div class="dfrom">' + (d.fromBus === 1 ? '① 첫 번째' : '② 두 번째') + ' 버스가 참고한 기록</div>';
+    var plus = suppNote(gc || {}).length > 0;
+    if (!r && !q && !hasT) {   // grey cell: no time, no number
+      var codes = Object.keys(cell.st || {}).map(function (k) { return cell.st[k]; }).filter(function (c) { return c && c !== 'rec' && c !== 'slot_absent'; });
+      if (!codes.length) codes = ['slot_absent'];
+      var u = uxStatus(codes[0]);
+      h += '<div class="dq q-na"><b>' + esc(u[0]) + '</b></div>' + (u[1] ? '<p class="dnote2">' + esc(u[1]) + '</p>' : '');
+    } else {
+      if (q) h += '<div class="dq q-' + q[0] + '"><b>' + QC[q[0]].name + '</b></div>';
+      else h += '<div class="dq q-na"><b>분류 불가</b></div><p class="dnote2">' + esc(q === null && agg && agg.q ? (QWHY[agg.q[1]] || '') : 'F(승차 후 빈자리) 기록이 없어 분류하지 않았어요.') + '</p>';
+      if (r) h += '<div class="dbig">예상 승차 여유 ' + (r[0] >= 1 ? '약 <b>' + Math.floor(r[0]) + '명</b>' : (r[0] > 0 ? '<b>1명 미만</b>' : '<b>0명</b>')) + '</div>';
+      else h += '<div class="dbig na">예상 승차 여유 계산 불가</div>';
+      var facts = '';
+      if (ref) {
+        var pd = ref.people_dates || [], td = ref.time_dates || [], borrowed = ['b', 'n', 'c'].indexOf(ref.mode) >= 0;
+        if (ref.mode === 'x') facts += '<li>인원·색을 계산할 기록이 없어요</li>';
+        else if (borrowed) { facts += '<li>이 요일 관측 기록 없음 · 보완값 참고' + (pd.length ? ' (' + datesTxt(pd) + ')' : '') + '</li>'; plus = true; if (td.length) facts += '<li>시각 관측 <b>' + td.length + '일</b> (' + datesTxt(td) + ')</li>'; }
+        else {
+          var K = r ? r[2] : null;
+          facts += '<li>참고 기록 <b>' + pd.length + '일</b> (' + datesTxt(pd) + ')' + (K != null && K !== pd.length ? ' · ' + K + '건' : '') + '</li>';
+          if (td.length && !sameSet(td, pd)) facts += '<li>시각은 <b>' + td.length + '일</b> (' + datesTxt(td) + ') 기록 기준</li>';
+          if (!td.length && !hasT) facts += '<li>시각은 시연용 보완값이에요</li>';
+        }
+        facts += '<li>기준 차종 <b>' + (ref.C === 70 ? '2층 70석' : (ref.C ? '일반 ' + ref.C + '석' : '미정')) + '</b></li>';
+      }
+      if (facts) h += '<ul class="dfacts">' + facts + '</ul>';
+      h += '<div class="dnote">시연용 추정' + (plus ? ' <span class="plus">＋ 보완값 사용</span>' : '') + ((gc && (gc.c || gc.p)) ? ' <span class="plus">◆ 해석 주의</span>' : '') + '</div>';
+    }
+    // minimal evidence + the shared explanation
+    var ev = '';
+    if (q) ev += '<div class="cs ev1"><b>이 칸의 분류</b><div>R 중앙값 <b>' + num(q[1], 1) + '명</b> → ' + (q[1] < 10 ? '10명 미만' : '10명 이상') + '</div><div>F 4석 이하 <b>' + q[5] + '/' + q[4] + '건</b> → q ' + (q[5] / q[4] >= 1 / 3 ? '≥' : '<') + ' 1/3</div><div>→ <span class="dq q-' + q[0] + '"><b>' + QC[q[0]].name + '</b></span></div></div>';
+    if (r || q || hasT) h += '<details class="evid"><summary>어떻게 계산했나요?</summary>' + calcHtml(ev) + '</details>';
+    el.innerHTML = h;
+    el.scrollTop = 0;
+    if (state.focusClose && isDesk() && state.detailOpen) { state.focusClose = false; var cb = $('#btn-close'); if (cb) { try { cb.focus({ preventScroll: true }); } catch (e) { cb.focus(); } } }
+  }
+
+  // ---------------------------------------------------------------- settings
+  function renderSettings() {
+    var el = $('#settings'), m = state.meta;
+    var dates = Object.keys(m.date_info).sort(), routes = m.routes.map(function (r) { return r.id; }).join('·');
+    var groups = m.day_groups.map(function (g) { return g.id + ' ' + (g.dates.length ? g.dates.length + '일' : '기록 없음'); }).join(' · ');
+    var sat = hasData('토') ? '공휴일이 아닌 토요일 기록 ' + typeDates('토').length + '일' : '공휴일이 아닌 토요일 기록은 아직 없어요';
+    el.innerHTML =
+      '<div class="panel"><button class="btn" id="btn-back">← 돌아가기</button><h2 style="margin-top:8px">설정·안내</h2></div>' +
+      '<div class="panel"><h2>서비스 소개</h2><p>과거 버스 기록으로 정류장별 승차 여유를 비교하는 체험용 서비스입니다.</p></div>' +
+      '<div class="panel"><h2>자료</h2><ul class="plain"><li>대상: ' + esc(routes) + ' (동탄→서울, 서울→동탄)</li><li>과거 기록: ' + esc(dates[0]) + ' ~ ' + esc(dates[dates.length - 1]) + '</li><li>체험용 도착정보는 가상 예시이며, 예상 승차 여유는 과거 기록 기반 시연용 추정입니다.</li>' +
+      '<li>승하차 인원 참고값: 경기도 공공데이터(공공데이터포털, 이용허락범위 제한 없음)를 가공했어요.</li><li>버스 도착·잔여석 기록: 경기버스정보(GBIS) 과거 도착정보를 가공한 시연용 자료예요.</li><li>배차 정보: 운수회사 배차표를 노선·차종 대응에 참고했어요.</li>' +
+      '<li>요일별 기록: ' + esc(groups) + ' (요일마다 기록이 적어 참고용이에요)</li><li>일·공휴일은 공휴일과 일요일을 묶은 시연용 집계예요. ' + esc(sat) + '.</li></ul></div>' +
+      '<div class="panel"><h2>계산 방법</h2>' + calcHtml() + '</div>' +
+      '<div class="panel"><h2>참고</h2><ul class="plain"><li>실제 현재 운행정보가 아닌 시연용 예시입니다.</li><li>예상값은 실제 탑승을 보장하지 않습니다.</li><li>자료 제공기관은 TAGOPA의 예상 결과와 무관하며 이를 보증하지 않습니다.</li><li>차량 정원과 승하차 인원은 시연용 가정이에요.</li></ul></div>' +
+      '';
+  }
+
+  function showSettings(on) { $('#settings').hidden = !on; $('#main').hidden = on; if (on) renderSettings(); }
+
+  // ---------------------------------------------------------------- popover for choosing the stop from a grid row
+  function openPopover(order, x, y) {
+    var s = stopByOrder(order), p = $('#popover');
+    state.popStop = order;
+    p.innerHTML = '<div class="nm">' + esc(s.name) + '</div><button class="btn" id="pop-set">이 정류장을 내 정류장으로</button><button class="btn" id="pop-close">닫기</button>';
+    p.hidden = false;
+    p.style.left = Math.min(x, window.innerWidth - 210) + 'px';
+    p.style.top = Math.min(y, window.innerHeight - 110) + 'px';
+  }
+  function closePopover() { $('#popover').hidden = true; state.popStop = null; }
+
+  // ---------------------------------------------------------------- render all and events
+  function renderAll() { renderControls(); renderCard(); renderStats(); renderDetail(); }
+  function setStop(order) {
+    state.stop = order; state.hl = null; state.banner = null; refreshBuses(); savePrefs(); renderCard(); renderStats();
+    prefetchBusGrids();
+    var row = document.querySelector('#grid tr.mine'), sc = $('#grid-scroll');
+    if (row && sc) {
+      var rr = row.getBoundingClientRect(), sr = sc.getBoundingClientRect();
+      if (rr.top < sr.top + 78) sc.scrollTop -= (sr.top + 78 - rr.top) + 4;
+      else if (rr.bottom > sr.bottom) sc.scrollTop += (rr.bottom - sr.bottom) + 4;
+    }
+    var b = document.querySelector('#card .stop-btn[data-stop="' + order + '"]'); if (b && b.focus) { try { b.focus({ preventScroll: true }); } catch (e) { b.focus(); } }
+  }
+  function scrollToDefault() {
+    var sc = $('#grid-scroll'); if (!sc) return;
+    var nI = now(), target = typeOfWd(WD[nI.wd]) === state.type ? nI.minutes : 7 * 60, ths = document.querySelectorAll('#grid thead th.col'), pick = null, vs = viewSlots();
+    for (var i = 0; i < vs.shown.length; i++) { var k = vs.shown[i].sort[state.dir]; if (k && k.minute != null && k.minute >= target - 5) { pick = ths[i]; break; } }
+    var stopW = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--stopw'), 10) || 112;
+    sc.scrollLeft = pick ? Math.max(0, pick.offsetLeft - stopW) : 0;
+    var row = document.querySelector('#grid tr.mine');
+    if (row) sc.scrollTop = Math.max(0, row.offsetTop - 120);
+  }
+  function resetAfterSelectionChange() { state.hl = null; state.banner = null; state.detail = null; state.detailOpen = false; state.showAll = false; state.showIncomplete = false; state.showMore = false; refreshBuses(); savePrefs(); }
+  function bind() {
+    $('#sel-route').addEventListener('change', function (e) {
+      state.trial.custom = true; state.route = e.target.value; state.dir = routeMeta().directions[0].id; state.stop = defaultStop(); resetAfterSelectionChange(); renderAll();
+      loadViewAndRender().then(function () { scrollToDefault(); prefetchBusGrids(); });
+    });
+    $('#sel-dir').addEventListener('change', function (e) {
+      state.trial.custom = true; state.dir = e.target.value; state.stop = defaultStop(); resetAfterSelectionChange(); renderAll();
+      loadViewAndRender().then(function () { scrollToDefault(); prefetchBusGrids(); });
+    });
+    $('#types').addEventListener('click', function (e) {
+      var b = e.target.closest('.seg'); if (!b) return;
+      state.type = b.getAttribute('data-type'); state.banner = null; state.hl = null; state.detail = null; state.detailOpen = false; state.showAll = false; state.showIncomplete = false; state.showMore = false;
+      renderStats(); renderDetail(); loadViewAndRender().then(scrollToDefault);       // the top card (real-time) is NOT changed by browsing the table
+    });
+    $('#colinfo').addEventListener('click', function (e) {
+      var id = e.target.id;
+      if (id === 'btn-more') { state.showMore = !state.showMore; if (!state.showMore) { state.showAll = false; state.showIncomplete = false; } renderColInfo(); renderGrid(); return; }   // folding returns to the default table
+      if (id === 'btn-showinc') { state.showIncomplete = !state.showIncomplete; renderColInfo(); renderGrid(); return; }
+      if (id === 'btn-showall') { state.showAll = !state.showAll; renderColInfo(); renderGrid(); }
+    });
+    $('#banner').addEventListener('click', function (e) {
+      if (e.target.id !== 'btn-undo') return;
+      state.type = state.banner.undo.type; state.banner = null; state.hl = null; state.detail = null; state.detailOpen = false;
+      renderStats(); renderDetail(); loadViewAndRender();
+    });
+    $('#card').addEventListener('click', function (e) {
+      var sc = e.target.closest('[data-scen]');
+      if (sc) { selectScenario(sc.getAttribute('data-scen')); return; }
+      var sb = e.target.closest('.stop-btn');
+      if (sb) { var o = parseInt(sb.getAttribute('data-stop'), 10); if (o !== state.stop) setStop(o); return; }
+      var go = e.target.closest('[data-go]');
+      if (go) { goBus(parseInt(go.getAttribute('data-go'), 10)); return; }
+    });
+    $('#grid').addEventListener('click', function (e) {
+      var td = e.target.closest('td'), th = e.target.closest('th.stop');
+      if (td) { openDetail({ slot: td.getAttribute('data-slot'), order: parseInt(td.getAttribute('data-stop'), 10), type: state.type }, { k: 'cell', slot: td.getAttribute('data-slot'), stop: td.getAttribute('data-stop') }); renderGrid(); renderDetail(); return; }
+      if (th) { var r = th.getBoundingClientRect(); openPopover(parseInt(th.getAttribute('data-stop'), 10), r.right + 6, r.top); }
+    });
+    $('#detail').addEventListener('click', function (e) { if (e.target.id === 'btn-close') closeDetail(); });
+    $('#scrim').addEventListener('click', closeDetail);
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && state.detail && (!isDesk() || state.detailOpen)) closeDetail(); });
+    window.addEventListener('resize', function () { if (state.detail) renderDetail(); else syncScrim(); });
+    $('#popover').addEventListener('click', function (e) {
+      if (e.target.id === 'pop-set') { var o = state.popStop; closePopover(); setStop(o); }
+      if (e.target.id === 'pop-close') closePopover();
+    });
+    document.addEventListener('click', function (e) { if (!e.target.closest('#popover') && !e.target.closest('th.stop')) closePopover(); });
+    $('#btn-settings').addEventListener('click', function () { showSettings(true); });
+    $('#settings').addEventListener('click', function (e) {
+      var id = e.target.id;
+      if (id === 'btn-back') showSettings(false);
+    });
+    $('#settings').addEventListener('change', function (e) {
+    });
+  }
+
+  // ---------------------------------------------------------------- start (URL parameters are only a development convenience for deep links / captures)
+  function start() {
+    Promise.all([fetchJson(BASE + 'meta.json'), fetchJson(BASE + 'trial.json'), fetchJson(BASE + 'operating_day.json')]).then(function (all) {
+      var meta = all[0]; TRIAL = all[1]; OPDAY = all[2];
+      state.meta = meta;
+      var tp = param('trial'), sid = tp === 'pm' ? 'commute_pm' : (tp === 'am' ? 'commute_am' : 'commute_am'), sc = scenarioById(sid);
+      state.trial = { id: sid, custom: false };
+      state.route = sc.route; state.dir = sc.dir; state.stop = sc.stop; state.type = typeOfWd(TRIAL.weekday);
+      var pr = param('route'), pd = param('dir'), ps = param('stop') ? parseInt(param('stop'), 10) : null;      // URL parameters: only for deep links and captures
+      if (pr && meta.routes.some(function (r) { return r.id === pr; })) { state.route = pr; state.trial.custom = true; if (pd && routeMeta().directions.some(function (d) { return d.id === pd; })) state.dir = pd; else state.dir = routeMeta().directions[0].id; state.stop = defaultStop(); }
+      if (ps && dirMeta().stops.indexOf(ps) >= 0) { state.stop = ps; }
+      if (param('type') && TYPE_LABEL[param('type')]) state.type = param('type');
+      refreshBuses();
+      bind(); renderAll();
+      return loadView().then(function () { renderStats(); renderCard(); scrollToDefault(); prefetchBusGrids(); });
+    }).then(function () {
+      var chain = Promise.resolve();
+      return chain.then(function () {
+        if (param('slot')) { openDetail({ slot: param('slot'), order: state.stop, type: state.type }, { k: 'cell', slot: param('slot'), stop: String(state.stop) }); renderGrid(); renderDetail(); scrollToCell(param('slot'), state.stop); }
+        if (param('go')) goBus(parseInt(param('go'), 10));
+      });
+    }).catch(function (err) {
+      $('#card').innerHTML = '<div class="loaderr"><b>시간표 자료를 불러오지 못했습니다.</b><br>' + esc(err.message) + '<br><span class="small">다른 값으로 대체하지 않았습니다. 웹 서버(또는 GitHub Pages)에서 열어 주세요.</span></div>';
+    });
+  }
+  window.__app = { state: state, cache: cache, connectBus: connectBus, goBus: goBus, guidanceHtml: guidanceHtml, opDay: opDay, selectScenario: selectScenario };
+  start();
+})();
