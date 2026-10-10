@@ -1,6 +1,6 @@
 /* TAGOPA — 광역버스 승차 여유 예측
  * 하단 표: 정류장 × 대표 운행편, 칸 = 대표 시각 + 2×2 네 분류. 카드: 두 가지 보기 — ① 실시간 조회(경기도 공식 버스도착정보 API를 브라우저에서 직접 호출, 사용자가 입력한 Decoding 키) ② 예시 보기(가상 출근·퇴근 시나리오).
- * 실시간 빈자리는 조회 시점 차내 빈자리이며 하단 표의 예상 승차 여유(과거 기록 기반)와 다른 값이다. 실시간 차량을 과거 대표편에 연결하지 않는다.
+ * 실시간 빈자리는 조회 시점 차내 빈자리이며 하단 표의 예상 승차 여유(과거 기록 기반)와 다른 값이다. 두 모드 모두 도착 예정 시각에 가장 가까운 과거 대표편을 같은 connectBus()로 찾아 통계적 참고자료로 연결한다(같은 실제 차량·운행편으로 확정한 것이 아님).
  * 자료: data/app/recent/ (meta → 인덱스 → 유형별 격자 → 슬롯별 상세, trial.json 예시 시나리오, operating_day.json 운행일 기준). 서버·프록시 없음. 인증키는 코드·자료·콘솔에 두지 않는다. */
 (function () {
   'use strict';
@@ -190,9 +190,11 @@
     if (!on) { state.dev.on = false; refreshBuses(); renderAll(); return Promise.resolve(); }
     return loadFixtures().then(function () { state.dev.on = true; if (caseId) state.dev.caseId = caseId; refreshBuses(); renderAll(); prefetchBusGrids(); });
   }
+  function curBuses() { return state.mode === 'live' ? (state.live.buses || []) : (state.buses || []); }   // the buses of the card that is shown (example scenario or live answer)
   function prefetchBusGrids() {
-    if (!state.buses) return;
-    state.buses.forEach(function (b) {
+    var bl = curBuses();
+    if (!bl.length) return;
+    bl.forEach(function (b) {
       if (!b.op.known) return;
       var t = b.op.group || typeOfWd(b.op.wd);
       if (hasData(t)) loadType(state.route, t).then(function () { renderCard(); }).catch(showLoadError);
@@ -225,16 +227,22 @@
     return { kind: 'linked', type: type, slot: best.slot, cell: best.cell, gap: best.gap, tie: tie, nCands: cands.length, cls: best.cell.q && best.cell.q[0] ? best.cell.q[0] : null };
   }
   // 줄 순서 안내: N = floor(R of the linked past run). A display rule, not a statistically verified safe lower bound.
-  function guidanceHtml(link) {
+  function guidanceHtml(link, live) {
     var r = link.cell && link.cell.r;
     var qc = link.cls ? ' q-' + link.cls : '';   // the colour of the referenced timetable cell; neutral when that cell cannot be classified
-    if (!r) return '<div class="bus-guide none' + qc + '">예상 승차 여유 정보가 아직 없어요.</div>';
+    var refl = live ? refLineHtml(link) : '';
+    if (!r) return '<div class="bus-guide none' + qc + '">' + (live ? '예상 승차 여유 정보 없음' : '예상 승차 여유 정보가 아직 없어요.') + refl + '</div>';
     var deck = link.slot && link.slot.ref_C === 70 ? ' <span class="deck">2층 기준</span>' : '';
+    var sfx = live ? ' <span class="small">(과거 기록 참고)</span>' : '';
     var n = Math.floor(r[0]);
-    if (n <= 0) return '<div class="bus-guide' + qc + '"><div class="gl1">예상 승차 여유 <b>' + (r[0] > 0 ? '1명 미만' : '0명') + '</b>' + deck + '</div></div>';
-    return '<div class="bus-guide' + qc + '"><div class="gl1">예상 승차 여유 약 <b>' + n + '명</b>' + deck + '</div></div>';
+    if (n <= 0) return '<div class="bus-guide' + qc + '"><div class="gl1">예상 승차 여유 <b>' + (r[0] > 0 ? '1명 미만' : '0명') + '</b>' + deck + sfx + '</div>' + refl + '</div>';
+    return '<div class="bus-guide' + qc + '"><div class="gl1">예상 승차 여유 약 <b>' + n + '명</b>' + deck + sfx + '</div>' + refl + '</div>';
   }
-
+  // live card only: which past representative run was used. It is the nearest past run by time, not the same physical bus; a large gap is stated.
+  function refLineHtml(link) {
+    var g = Math.round(Math.abs(link.gap)), far = g >= 10;
+    return '<div class="small gl-ref">가장 가까운 과거 참고편 ' + esc(hm(link.cell.t[1])) + '경' + (far ? ' · 예상 도착과 ' + g + '분 차이' : '') + '</div>';
+  }
   // ---------------------------------------------------------------- live lookup (one call per explicit user action; no automatic repetition)
   function lsGet() { try { return window.localStorage.getItem(LS_KEY); } catch (e) { return null; } }
   function lsSet(v) { try { if (v == null) window.localStorage.removeItem(LS_KEY); else window.localStorage.setItem(LS_KEY, v); return true; } catch (e) { return false; } }
@@ -262,8 +270,13 @@
       var p = liveParse(x.status, x.text);
       if (p.kind === 'ok' || p.kind === 'none') {
         var k = kstNow();
+        (p.buses || []).forEach(function (b) {   // arrival = response time + ETA (seconds when given), fixed now: later clock changes or day tabs never move the reference run
+          var etaSec = b.sec != null ? b.sec : b.minutes * 60;
+          b.op = resolveOperatingDay({ minutes: Math.round((k.sec + etaSec) / 60) }, { minutes: k.minutes, date: k.date });
+        });
         state.live = { status: p.kind, tok: tok, buses: p.buses || [], flag: p.flag || '', at: pad(Math.floor(k.minutes / 60)) + ':' + pad(k.minutes % 60) + ':' + pad(k.sec), atMin: k.minutes, why: '' };
-        renderCard();
+        state.hl = null;
+        renderCard(); prefetchBusGrids();
       } else liveFail(tok, p.why);
     }, function () { liveFail(tok, '연결에 실패했어요. 네트워크 상태를 확인해 주세요. 브라우저가 요청을 막았을 수도 있어요.'); });
   }
@@ -296,17 +309,21 @@
     return { kind: buses.length ? 'ok' : 'none', buses: buses, flag: flag };
   }
   function liveBusHtml(b) {
-    var names = ['첫 번째 버스', '두 번째 버스'], k = kstNow(), arr = (state.live.atMin != null ? state.live.atMin : k.minutes) + b.minutes;
+    var names = ['첫 번째 버스', '두 번째 버스'], o = b.op, link = connectBus(b);
     var eta = b.minutes <= 0 || (b.sec != null && b.sec < 60) ? '곧 도착' : b.minutes + '분 후';
     var seats = (b.seats == null || b.seats < 0) ? '<span class="small">빈자리 정보 없음</span>' : '현재 빈자리 <b>' + b.seats + '석</b>';
     var extra = [];
     if (b.loc != null && b.loc >= 0) extra.push(b.loc === 0 ? '이 정류장 도착' : b.loc + '정류장 전');
     if (b.low != null && LOWPLATE[b.low]) extra.push(LOWPLATE[b.low]);
-    return '<div class="bus live" data-bus="' + b.idx + '"><div class="bus-head"><span>' + (b.idx === 1 ? '①' : '②') + ' ' + names[b.idx - 1] + ' · <b>' + eta + '</b> <span class="eta">(' + hm(arr % 1440) + '경 도착 예정)</span></span></div>' +
+    var h = '<div class="bus live' + (link.kind === 'linked' && link.cls ? ' qa-' + link.cls : '') + '" data-bus="' + b.idx + '"><div class="bus-head"><span>' + (b.idx === 1 ? '①' : '②') + ' ' + names[b.idx - 1] + ' · <b>' + eta + '</b> <span class="eta">(' + o.hhmm + '경 도착 예정)</span></span></div>' +
       '<div class="bus-obs">' + seats + (b.seats != null && b.seats >= 0 ? ' <span class="small">· ' + esc(state.live.at.slice(0, 5)) + ' 조회 기준</span>' : '') + '</div>' +
-      (extra.length ? '<div class="bus-ref live-extra">' + esc(extra.join(' · ')) + '</div>' : '') + '</div>';
-  }
-  function liveBodyHtml() {
+      (extra.length ? '<div class="bus-ref live-extra">' + esc(extra.join(' · ')) + '</div>' : '');
+    if (link.kind === 'loading') h += '<div class="bus-guide none">불러오는 중…</div>';
+    else if (link.kind === 'hold') h += '<div class="bus-guide none">참고할 과거 기록을 고르지 못했어요.<div class="small">' + esc(link.reason) + '</div></div>';
+    else if (link.kind === 'none') h += '<div class="bus-guide none">' + (hasData(link.type) ? '참고할 과거 기록이 없어요.<div class="small">' + esc(link.reason) + '</div>' : '해당 요일의 과거 기록이 없습니다.') + '</div>';
+    else h += guidanceHtml(link, true) + '<div class="bus-ref"><button class="btn primary bus-go" data-go="' + b.idx + '">시간표에서 보기 ▸</button></div>';
+    return h + '</div>';
+  }  function liveBodyHtml() {
     var L = state.live;
     if (L.status === 'nokey') return '<div class="rt-empty">실시간 조회에는 인증키가 필요해요. <button type="button" class="btn primary" data-act="open-key">인증키 입력</button><div class="small">키 없이는 \'예시 보기\'를 이용할 수 있어요.</div></div>';
     if (L.status === 'loading' || L.status === 'idle') return '<div class="rt-empty">조회 중…</div>';
@@ -317,7 +334,7 @@
       return '<div class="rt-empty">현재 도착 예정 버스가 없습니다.' + fl + '</div>';
     }
     h = L.buses.map(liveBusHtml).join('');
-    return h + '<div class="small live-note">현재 빈자리는 조회한 시점의 이 버스 값이에요. 아래 시간표의 예상 승차 여유는 과거 기록으로 계산한 값으로 서로 달라요.</div>';
+    return h + '<div class="small live-note">현재 빈자리는 조회 시점의 값이고, 예상 승차 여유는 과거 기록에서 계산한 값이에요. 과거 참고편은 같은 버스가 아니라 도착 시각이 가장 가까운 대표편이에요.</div>';
   }
   function modeBarHtml() {
     return '<div class="modes" role="tablist" aria-label="보기 방식">' + [['live', '실시간 조회'], ['example', '예시 보기']].map(function (m) {
@@ -391,7 +408,7 @@
     return loadViewAndRender().then(function () { scrollToDefault(); prefetchBusGrids(); });
   }
   function goBus(idx) {
-    var b = state.buses.filter(function (x) { return x.idx === idx; })[0];
+    var b = curBuses().filter(function (x) { return x.idx === idx; })[0];
     if (!b) return;
     var link = connectBus(b);
     if (link.kind === 'loading') { loadType(state.route, b.op.group || typeOfWd(b.op.wd)).then(function () { renderCard(); goBus(idx); }).catch(showLoadError); return; }
@@ -401,10 +418,11 @@
     state.type = link.type;
     state.banner = changed ? { text: '표를 ' + TYPE_LABEL[link.type] + ' 기준으로 바꿨어요. 위 카드는 그대로예요.', undo: prev } : null;
     var my = viewKey();
-    var idxs = state.buses.filter(function (x) { var l = connectBus(x); return l.kind === 'linked' && l.slot.id === link.slot.id && l.type === link.type; }).map(function (x) { return x.idx; });
+    var idxs = curBuses().filter(function (x) { var l = connectBus(x); return l.kind === 'linked' && l.slot.id === link.slot.id && l.type === link.type; }).map(function (x) { return x.idx; });
     state.hl = { idxs: idxs, clicked: idx, slot: link.slot.id, stop: state.stop, type: link.type, route: state.route, dir: state.dir };
     loadView().then(function () {
       if (my !== viewKey()) return;
+      if (!viewSlots().shown.some(function (s) { return s.id === link.slot.id; })) { state.showMore = true; state.showAll = true; }   // the referenced column must be visible
       openDetail({ slot: link.slot.id, order: state.stop, type: link.type, fromBus: idx }, { k: 'bus', idx: idx });
       renderStats(); renderDetail(); scrollToCell(link.slot.id, state.stop);
     }).catch(showLoadError);
