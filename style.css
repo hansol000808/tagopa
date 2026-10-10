@@ -107,15 +107,12 @@ table#grid { border-collapse: separate; border-spacing: 0; table-layout: fixed; 
 #grid td .mk { position: absolute; top: 1px; right: 2px; font-size: 11px; font-weight: 700; color: #b0171d; background: #fff; border-radius: 8px; padding: 0 3px; line-height: 14px; }
 #grid td .mc, #grid td .mp { position: absolute; left: 2px; top: 0; font-size: 11px; line-height: 14px; color: #8a3b00; }
 #grid td .mp { left: auto; right: 2px; top: 14px; color: #6a7a8c; }
-#grid thead th.col { min-width: var(--colw); width: var(--colw); height: 78px; font-size: 11px; line-height: 1.15; padding: 2px 1px; vertical-align: top; cursor: default; }
-#grid thead th.col .rk { display: block; color: var(--muted); font-size: 10px; }
-#grid thead th.col .rt { display: block; font-size: 12px; font-weight: 700; }
+#grid thead th.col { min-width: var(--colw); width: var(--colw); height: 30px; font-size: 11px; line-height: 1.15; padding: 2px 1px; vertical-align: top; cursor: default; }
 #grid thead th.col .bd { display: block; font-weight: 400; }
 #grid thead th.col .bd i { display: block; font-style: normal; font-size: 9.5px; color: var(--muted); }
 #grid thead th.col .bd i.ms { color: #8a3b00; font-weight: 600; }
-#grid thead th.col .bd i.one { color: #8a3b00; }
 #grid thead th.col.hl { background: #dbe9ff; }
-#grid thead th { height: 78px; }
+#grid thead th { height: 30px; }
 .legend { margin-top: 8px; font-size: 12.5px; color: var(--muted); display: grid; gap: 4px; }
 .legend .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 4px; vertical-align: -1px; }
 .legend .stlist span { margin-right: 10px; white-space: nowrap; }
@@ -232,9 +229,6 @@ table#grid { border-collapse: separate; border-spacing: 0; table-layout: fixed; 
 .refs { margin-top: 4px; }
 .refbtn { margin: 2px 4px 2px 0; white-space: normal; text-align: left; }
 
-/* ---- header cells of the grid: selected-stop time first, sort-reference time second */
-#grid thead th.col .rt { font-size: 13px; }
-#grid thead th.col .rk { font-size: 9.5px; }
 
 /* ---- week chips: seven in one row at 375px */
 .chips { flex-wrap: nowrap; gap: 4px; }
@@ -316,7 +310,6 @@ details.inl > summary { display: inline; cursor: pointer; color: var(--accent); 
 #grid td .sm.pp { padding-top: 1px; font-size: 11.5px; font-weight: 600; opacity: 1; padding-right: 22px; white-space: nowrap; }
 #grid td .tm { padding-top: 4px; }
 #grid td.st .sm { padding-top: 15px; }
-#grid thead th.col .rk { display: none; }
 .detail h3 .h3n { white-space: normal; }
 .detail .bigt { white-space: nowrap; display: inline-block; }
 .bus-guide.q-r { background: var(--qr); color: var(--qrt); }

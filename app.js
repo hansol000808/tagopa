@@ -504,6 +504,16 @@
     el.innerHTML = more;
   }
   function renderStats() { renderTypes(); renderBasis(); renderBanner(); renderColInfo(); renderGrid(); renderLegend(); }
+  // run-kind mark of a column header: only what the data derived for the SELECTED weekday group and direction (index.kinds): c = 전세 (출근 전세는 동탄→서울 열에만, 퇴근 전세는 서울→동탄 열에만 나타남), m = 전세(중간) with the
+  // designated start (existing ms_text), t = 임시 추정 (reserved: only with positive evidence of an extra trip; none is derived). Regular, mixed and unconfirmed columns get no mark; the front end never infers a kind.
+  var KIND_TITLE = '전세 시간표(2026-09-30 본문 이미지)와 대응된 운행이에요. 정상 평일 전체에 적용한 것은 시연 가정이고 적용 기간은 확인하지 못했어요.';
+  function runKindMark(s) {
+    var k = s.kinds && s.kinds[state.type] && s.kinds[state.type][state.dir];
+    if (k === 'c') return '<i class="ms" title="' + esc(KIND_TITLE) + '">전세</i>';
+    if (k === 'm') return '<i class="ms" title="' + esc(KIND_TITLE) + '">전세(중간) ' + esc(s.ms_text) + '</i>';
+    if (k === 't') return '<i class="ms">임시 추정</i>';
+    return '';
+  }
   function renderGrid() {
     var tbl = $('#grid');
     if (!hasData(state.type) || !getIndex() || !getGrid()) { tbl.innerHTML = ''; return; }
@@ -511,10 +521,9 @@
     var h = '<thead><tr><th class="corner">정류장</th>';
     vs.shown.forEach(function (s, i) {
       var hl = state.hl && state.hl.slot === s.id && state.hl.type === state.type;
-      var c = selCell(s.id), st = c && c.t ? hm(c.t[1]) : (c && c.u && c.u[1] != null ? hm(c.u[1]) : '—');
-      h += '<th class="col' + (hl ? ' hl' : '') + '" data-slot="' + esc(s.id) + '" title="' + esc('이 정류장 대표 시각 ' + (c && c.t ? hm(c.t[1]) : '기록 없음')) + '">' +
-        '<span class="rt">' + esc(st) + '</span>' +
-        '<span class="bd">' + (s.kind === 'confirmed_midstart' ? '<i class="ms">중간출발 ' + esc(s.ms_text) + '</i>' : '') + (s.n_dates === 1 ? '<i class="one">1일만 관측</i>' : '') + (s.ref_C === 70 ? '<i class="deck">2층 기준</i>' : '') + '</span></th>';
+      // the column header carries no time: the time of a representative run differs by stop and is not a timetable (departure) time; the time of each stop is in its cell. The column ORDER (sort key) is unchanged.
+      h += '<th class="col' + (hl ? ' hl' : '') + '" data-slot="' + esc(s.id) + '">' +
+        '<span class="bd">' + runKindMark(s) + (s.ref_C === 70 ? '<i class="deck">2층 기준</i>' : '') + '</span></th>';
     });
     h += '</tr></thead><tbody>';
     stops.forEach(function (st) {
@@ -587,8 +596,9 @@
     var stopW = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--stopw'), 10) || 112;
     var tr = td.getBoundingClientRect(), sr = sc.getBoundingClientRect();
     sc.scrollLeft = Math.max(0, sc.scrollLeft + (tr.left - sr.left) - stopW - 8);
-    sc.scrollTop = Math.max(0, sc.scrollTop + (tr.top - sr.top) - 90);
+    sc.scrollTop = Math.max(0, sc.scrollTop + (tr.top - sr.top) - headH() - 12);
   }
+  function headH() { var th = document.querySelector('#grid thead th'); return th ? th.offsetHeight : 40; }      // sticky header height (the grid header holds no time, only the 2층/중간출발 marks)
   function renderLegend() {
     var sw = ['r', 'o', 'y', 'g'].map(function (k) { return '<div class="lg"><i class="sw q-' + k + '"></i><span><b>' + QC[k].name + '</b></span></div>'; }).join('');
     $('#legend').innerHTML = '<div class="lgrid">' + sw + '</div>' +
@@ -756,7 +766,7 @@
     var row = document.querySelector('#grid tr.mine'), sc = $('#grid-scroll');
     if (row && sc) {
       var rr = row.getBoundingClientRect(), sr = sc.getBoundingClientRect();
-      if (rr.top < sr.top + 78) sc.scrollTop -= (sr.top + 78 - rr.top) + 4;
+      if (rr.top < sr.top + headH()) sc.scrollTop -= (sr.top + headH() - rr.top) + 4;
       else if (rr.bottom > sr.bottom) sc.scrollTop += (rr.bottom - sr.bottom) + 4;
     }
     var b = document.querySelector('#card .stop-btn[data-stop="' + order + '"]'); if (b && b.focus) { try { b.focus({ preventScroll: true }); } catch (e) { b.focus(); } }
@@ -768,7 +778,7 @@
     var stopW = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--stopw'), 10) || 112;
     sc.scrollLeft = pick ? Math.max(0, pick.offsetLeft - stopW) : 0;
     var row = document.querySelector('#grid tr.mine');
-    if (row) sc.scrollTop = Math.max(0, row.offsetTop - 120);
+    if (row) sc.scrollTop = Math.max(0, row.offsetTop - headH() - 42);
   }
   function resetAfterSelectionChange() { state.hl = null; state.banner = null; state.detail = null; state.detailOpen = false; state.showAll = false; state.showIncomplete = false; state.showMore = false; refreshBuses(); savePrefs(); }
   function bind() {
