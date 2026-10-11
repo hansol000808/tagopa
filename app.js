@@ -623,16 +623,15 @@
     var r = agg && agg.ref;
     if (!r) return '';
     var deck = r.C ? (r.C === 70 ? '2층 70석' : '일반 45석') : '미정';
-    var h = '<div class="refdeck"><b>기준 차종 ' + deck + '</b> <span class="small">(시연 기준 · 실제 버스 차종을 읽은 값이 아니에요)</span><div class="small">시각: ' + (r.time_dates.length ? (r.time_policy === 'r' ? '직접 관측한 기준 차종 기록 ' : '직접 관측한 모든 차종 기록 ') + r.time_dates.length + '일(' + esc(dlist(r.time_dates)) + ')' : '선택한 요일에 직접 관측한 시각 없음 — 표의 시각은 시연용 보완값(＋)') + '</div>';
-    var pd = r.people_dates.length + '일(' + esc(dlist(r.people_dates)) + ')';
-    if (r.mode === 's') h += '<div class="small">예상 인원·색: ' + TYPE_LABEL[group] + ' 기준 차종 기록 ' + pd + '</div>';
-    else if (r.mode === 'f') h += '<div class="small">예상 인원·색: ' + TYPE_LABEL[group] + ' 기준 차종 기록 ' + pd + ' · 이 중 ' + (agg.Fcsv || 0) + '건은 F가 없어 CSV 참고 합성 F를 썼어요(관측·다음 정류장 연결값이 아니에요).</div>';
+    var h = '<div class="refdeck"><b>기준 차종</b>: ' + deck + ' (시연 기준)<div class="small">시각: ' + (r.time_dates.length ? r.time_dates.length + '일 (' + esc(dlist(r.time_dates)) + ')' : '선택한 요일에 직접 관측한 시각 없음 — 표의 시각은 시연용 보완값(＋)') + '</div>';
+    var pd = r.people_dates.length + '일 (' + esc(dlist(r.people_dates)) + ')';
+    if (r.mode === 's') h += '<div class="small">예상 인원·색: ' + pd + '</div>';
+    else if (r.mode === 'f') h += '<div class="small">예상 인원·색: ' + pd + ' · 이 중 ' + (agg.Fcsv || 0) + '건은 F가 없어 CSV 참고 합성 F(관측·다음 정류장 연결값 아님)</div>';
     else if (r.mode === 'b') h += '<div class="small"><b>보완</b> 예상 인원·색: 이 요일에 기준 차종의 쓸 수 있는 기록이 없어 같은 배차 유형의 다른 날짜 ' + pd + '의 같은 대표편·같은 차종 기록을 참고했어요. 관측 날짜 수에는 넣지 않았어요.</div>';
     else if (r.mode === 'n') h += '<div class="small"><b>보완</b> 예상 인원·색: 같은 운행의 앞뒤 기록으로 만든 시연용 값(' + pd + ')이에요. 관측 날짜 수에는 넣지 않았어요.</div>';
     else if (r.mode === 'c') h += '<div class="small"><b>보완</b> 예상 인원·색: 같은 정류장·배차 유형·차종에서 가장 가까운 시각의 대표편(' + esc(r.src ? r.src.slot : '') + ', 시각 차이 ' + (r.src && r.src.gap_min != null ? Math.abs(r.src.gap_min) : '') + '분, ' + esc(r.src ? ({ 'same weekday': '같은 요일의 기록', 'other dates of the type': '같은 유형의 다른 날짜 기록' }[r.src.scope] || '') : '') + ')의 실제 기록 ' + pd + '을 참고했어요. 그 날짜들의 값을 한 번씩만 썼고 이 대표편의 관측 날짜 수에는 넣지 않았어요.</div>';
     else if (r.mode === 'x') h += '<div class="small">예상 인원·색: 쓸 수 있는 기준 차종 기록이 없어 계산하지 않았어요.</div>';
-    if (r.other_capacity.length) h += '<div class="small">' + (r.time_policy === 'r' ? '다른 차종이라 인원·색과 시각에서 제외(원본은 그대로): ' : '다른 차종이라 인원·색에서 제외(시각에는 사용, 원본은 그대로): ') + r.other_capacity.map(function (o) { return esc(o.d.slice(5)) + ' ' + o.C + '석'; }).join(', ') + '</div>';
-    return h + '</div>';
+    return h + '</div>';      // the excluded other-deck dates stay in the data (ref.other_capacity) and in the analysis files; the drawer no longer prints them
   }
   function sname(o) { var x = stopByOrder(o); return x ? x.name : o + '번'; }
   function isDesk() { return window.matchMedia('(min-width: 1000px)').matches; }
