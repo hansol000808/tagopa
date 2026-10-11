@@ -77,8 +77,6 @@ button, select { font: inherit; }
 .chip .today { font-size: 10px; margin-left: 3px; opacity: .85; }
 .basis { margin: 8px 0 6px; font-size: 13px; color: var(--muted); }
 .basis b { color: var(--ink); }
-.banner { background: #eaf3ff; border: 1px solid #b6d3f2; border-radius: 8px; padding: 6px 10px; margin-bottom: 6px; font-size: 13px; display: flex; gap: 8px; justify-content: space-between; align-items: center; }
-.banner[hidden] { display: none; }
 .grid-wrap { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
 .grid-scroll { overflow: auto; max-height: 58vh; background: #fff; }
 .grid-scroll:focus { outline: 2px solid #9cc3dc; outline-offset: -2px; }

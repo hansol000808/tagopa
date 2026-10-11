@@ -19,7 +19,7 @@
     y: { name: '조금 남아요', short: '노', def: '탈 자리는 적지만, 사람들이 타고도 조금 남는 편이에요. (R 중앙값 10명 미만, F 4석 이하 기록이 1/3 미만)' },
     g: { name: '여유로워요', short: '초', def: '탈 자리가 넉넉하고, 사람들이 타고도 남는 편이에요. (R 중앙값 10명 이상, F 4석 이하 기록이 1/3 미만)' }
   };
-  var QWHY = { F_missing: 'F(출발 후 잔여)가 없음', R_missing: 'R(합성 승차 전 여유)을 계산하지 않음', no_records: '기록 없음' };
+  var QWHY = { F_missing: 'F(출발 후 잔여)가 없음', R_missing: 'R(승차 전 여유) 미계산', no_records: '기록 없음' };
   var WHY = {
     arrival_field_matches: '도착 시각 필드와 RArrivalDate가 같아 도착형으로 읽음 (시각 필드의 일치이며 잔여석을 잰 순간을 직접 확인한 것은 아님)',
     origin_departure_only: '기점의 출발 시각만 있는 기록 → 출발형', confirmed_midstart_departure_only: '확인된 중간 출발편의 출발 시각 기록 → 출발형',
@@ -30,7 +30,7 @@
 
   var state = {
     meta: null, route: 'M4130', dir: 'down', stop: null, type: 'normal_weekday', showAll: false, showIncomplete: false, showMore: false,
-    hl: null, banner: null, detail: null, detailOpen: false, trigger: null, focusClose: false, popStop: null, loadErr: null, loaded: [],
+    hl: null, detail: null, detailOpen: false, trigger: null, focusClose: false, popStop: null, loadErr: null, loaded: [],
     dev: { on: false, caseId: 'A', fixtures: null }, buses: null, busesAt: null,
     trial: { id: 'commute_am', custom: false },
     mode: 'example', live: { status: 'idle', tok: 0, buses: [], flag: '', at: '', why: '' }, liveAuto: { last: 0, idle: false, stopped: false, fails: 0, active: Date.now() }
@@ -383,7 +383,7 @@
     state.mode = m;
     if (m === 'example') { clearTimeout(autoTimer); autoTimer = null; selectScenario(state.trial.id); return; }   // the example view never calls the API
     liveAutoReset();
-    state.banner = null; state.detail = null; state.detailOpen = false; refreshBuses(); renderCard(); renderStats(); renderDetail();
+    state.detail = null; state.detailOpen = false; refreshBuses(); renderCard(); renderStats(); renderDetail();
   }
 
   // ---------------------------------------------------------------- controls
@@ -450,10 +450,7 @@
     var link = connectBus(b);
     if (link.kind === 'loading') { loadType(state.route, b.op.group || typeOfWd(b.op.wd)).then(function () { renderCard(); goBus(idx); }).catch(showLoadError); return; }
     if (link.kind !== 'linked') return;
-    var prev = { type: state.type };
-    var changed = state.type !== link.type;
     state.type = link.type;
-    state.banner = changed ? { text: '표를 ' + TYPE_LABEL[link.type] + ' 기준으로 바꿨어요. 위 카드는 그대로예요.', undo: prev } : null;
     var my = viewKey();
     var idxs = curBuses().filter(function (x) { var l = connectBus(x); return l.kind === 'linked' && l.slot.id === link.slot.id && l.type === link.type; }).map(function (x) { return x.idx; });
     state.hl = { idxs: idxs, clicked: idx, slot: link.slot.id, stop: state.stop, type: link.type, route: state.route, dir: state.dir };
@@ -480,12 +477,6 @@
     var ds = typeDates(state.type);
     $('#basis').innerHTML = ds.length ? '<b>' + TYPE_LABEL[state.type] + '</b> 최근 기록 ' + ds.length + '일 <details class="inl"><summary>날짜 보기</summary><div class="small">' + esc(datesList(state.type)) + '<br>' + esc(state.type === '일·공휴일' ? state.meta.types.holiday_block.note : '이 요일의 공휴일이 아닌 날짜만 쓰고 다른 요일과 섞지 않아요.') + '</div></details>' : '';
   }
-  function renderBanner() {
-    var el = $('#banner');
-    if (!state.banner) { el.hidden = true; el.innerHTML = ''; return; }
-    el.hidden = false;
-    el.innerHTML = '<span>' + esc(state.banner.text) + '</span><button class="btn" id="btn-undo">이전 표(' + esc(TYPE_LABEL[state.banner.undo.type]) + ')로</button>';
-  }
   function renderColInfo() {
     var el = $('#colinfo');
     if (!hasData(state.type)) {
@@ -503,10 +494,10 @@
     }
     el.innerHTML = more;
   }
-  function renderStats() { renderTypes(); renderBasis(); renderBanner(); renderColInfo(); renderGrid(); renderLegend(); }
+  function renderStats() { renderTypes(); renderBasis(); renderColInfo(); renderGrid(); renderLegend(); }
   // run-kind mark of a column header: only what the data derived for the SELECTED weekday group and direction (index.kinds): c = 전세 (출근 전세는 동탄→서울 열에만, 퇴근 전세는 서울→동탄 열에만 나타남), m = 전세(중간) with the
   // designated start (existing ms_text), t = 임시 추정 (reserved: only with positive evidence of an extra trip; none is derived). Regular, mixed and unconfirmed columns get no mark; the front end never infers a kind.
-  var KIND_TITLE = '전세 시간표(2026-09-30 본문 이미지)와 대응된 운행이에요. 정상 평일 전체에 적용한 것은 시연 가정이고 적용 기간은 확인하지 못했어요.';
+  var KIND_TITLE = '전세 시간표(2026-09-30 본문 이미지) 대응 운행 · 정상 평일 전체에 적용한 가정 · 적용 기간 미확인';
   function runKindMark(s) {
     var k = s.kinds && s.kinds[state.type] && s.kinds[state.type][state.dir];
     if (k === 'c') return '<i class="ms" title="' + esc(KIND_TITLE) + '">전세</i>';
@@ -540,12 +531,12 @@
     if (r[0] >= 1) return '(' + Math.floor(r[0]) + '명)';
     return r[0] > 0 ? '(1명 미만)' : '(0명)';
   }
-  var MODE_NOTE = { b: '인원·색: 이 요일에 기준 차종 기록이 없어 같은 배차 유형의 다른 날짜 기록 참고', n: '인원·색: 같은 운행의 앞뒤 기록으로 보완', c: '인원·색: 같은 정류장·배차 유형·차종에서 가장 가까운 시각의 다른 대표편 기록 참고', f: '일부 F는 CSV 참고 합성' };
+  var MODE_NOTE = { b: '인원·색: 이 요일에 기준 차종 기록이 없어 같은 배차 유형의 다른 날짜 기록 참고', n: '인원·색: 같은 운행의 앞뒤 기록으로 보완', c: '인원·색: 같은 정류장·배차 유형·차종에서 가장 가까운 시각의 다른 대표편 기록 참고', f: '일부 F: 2025년 승하차 통계 기반 추정' };
   function suppNote(c) {
     var a = [];
-    if (!c.t && c.u && c.u[1] != null) a.push('시각: 시연용 보완(관측 없음)');
+    if (!c.t && c.u && c.u[1] != null) a.push('시각: 과거 기록 기반 보완값(관측 없음)');
     if (c.m && MODE_NOTE[c.m]) a.push(MODE_NOTE[c.m] + (c.bd && c.bd.length ? ' (' + c.bd.join(', ') + ')' : '') + (c.sr ? ' (' + (c.sr[0] ? c.sr[0] + ', 시각차 ' + c.sr[1] + '분, ' : '') + c.sr[2].join(', ') + ')' : ''));
-    if (c.fs && c.m !== 'f') a.push('일부 F는 CSV 참고 합성');
+    if (c.fs && c.m !== 'f') a.push('일부 F: 2025년 승하차 통계 기반 추정');
     return a;
   }
   function cellHtml(s, st, ndw) {
@@ -579,7 +570,7 @@
   }
   // user-facing wording of a cell state. The internal codes are NOT merged: before_seoul_start (demonstration start chosen from the first observation; actual service unknown) and not_operating (designated mid-start run, evidenced) keep their own codes.
   var STATUS_UX = {
-    before_seoul_start: ['운행 안 함', '시연상 운행하지 않는 구간으로 처리했어요. 실제 운행 여부는 미확인입니다.'],
+    before_seoul_start: ['운행 안 함', '적용 운행 기준상 영업 대상 아님 (실제 운행 여부 미확인)'],
     not_operating: ['운행 안 함', '이 편은 이 정류장에서 운행하지 않아요(지정 중간 출발편).'],
     not_target: ['영업 대상 아님', '이 방향에서는 승차 안내를 하지 않는 운행이에요.'],
     beyond_last: ['관측 밖', '이 운행의 마지막 기록 이후라 값을 만들지 않았어요.'],
@@ -608,12 +599,12 @@
     return '<div class="calc">' + (evHtml || '') +
       '<div class="cs"><b>승차 여유 계산</b><p class="fm">R = V + A</p><p class="fm">F = R − B</p>' +
       '<ul class="vars"><li><b>V</b> 도착 시 빈자리</li><li><b>A</b> 예상 하차 인원</li><li><b>B</b> 예상 승차 인원</li><li><b>R</b> 승차 전 여유</li><li><b>F</b> 승차 후 빈자리</li></ul>' +
-      '<p class="fd">A·B는 시연용 합성값이에요. 칸의 숫자는 R 중앙값(소수점 버림)이에요.</p></div>' +
+      '<p class="fd">A·B: 과거 운행기록 및 승하차 통계 기반 추정값 (실제 측정 인원 아님)<br>칸의 숫자: R 중앙값 (소수점 버림)</p></div>' +
       '<div class="cs"><b>색상 분류</b><p class="fd">R 중앙값 10명 기준 · q = F가 4석 이하인 기록 비율 (경계 1/3)</p>' +
       '<table class="qt"><thead><tr><th></th><th>q ≥ 1/3</th><th>q &lt; 1/3</th></tr></thead><tbody>' +
       '<tr><th>R &lt; 10명</th><td>' + sw('r') + '</td><td>' + sw('y') + '</td></tr>' +
       '<tr><th>R ≥ 10명</th><td>' + sw('o') + '</td><td>' + sw('g') + '</td></tr></tbody></table>' +
-      '<p class="fd">과거 기록을 이용한 시연용 분류이며 실제 탑승 확률은 아니에요.</p></div>' +
+      '<p class="fd">혼잡 색상: 과거 기록 기반 분류 (실제 탑승 확률 아님)</p></div>' +
       '<p class="fd sym">＋ 보완값 · ◆ 해석 주의 · 24 자정 이후 운행</p></div>';
   }
 
@@ -623,14 +614,14 @@
     var r = agg && agg.ref;
     if (!r) return '';
     var deck = r.C ? (r.C === 70 ? '2층 70석' : '일반 45석') : '미정';
-    var h = '<div class="refdeck"><b>기준 차종</b>: ' + deck + ' (시연 기준)<div class="small">시각: ' + (r.time_dates.length ? r.time_dates.length + '일 (' + esc(dlist(r.time_dates)) + ')' : '선택한 요일에 직접 관측한 시각 없음 — 표의 시각은 시연용 보완값(＋)') + '</div>';
+    var h = '<div class="refdeck"><b>기준 차종</b>: ' + deck + '<div class="small">시각: ' + (r.time_dates.length ? r.time_dates.length + '일 (' + esc(dlist(r.time_dates)) + ')' : '선택한 요일 직접 관측 없음 · 과거 기록 기반 보완값(＋)') + '</div>';
     var pd = r.people_dates.length + '일 (' + esc(dlist(r.people_dates)) + ')';
     if (r.mode === 's') h += '<div class="small">예상 인원·색: ' + pd + '</div>';
-    else if (r.mode === 'f') h += '<div class="small">예상 인원·색: ' + pd + ' · 이 중 ' + (agg.Fcsv || 0) + '건은 F가 없어 CSV 참고 합성 F(관측·다음 정류장 연결값 아님)</div>';
-    else if (r.mode === 'b') h += '<div class="small"><b>보완</b> 예상 인원·색: 이 요일에 기준 차종의 쓸 수 있는 기록이 없어 같은 배차 유형의 다른 날짜 ' + pd + '의 같은 대표편·같은 차종 기록을 참고했어요. 관측 날짜 수에는 넣지 않았어요.</div>';
-    else if (r.mode === 'n') h += '<div class="small"><b>보완</b> 예상 인원·색: 같은 운행의 앞뒤 기록으로 만든 시연용 값(' + pd + ')이에요. 관측 날짜 수에는 넣지 않았어요.</div>';
-    else if (r.mode === 'c') h += '<div class="small"><b>보완</b> 예상 인원·색: 같은 정류장·배차 유형·차종에서 가장 가까운 시각의 대표편(' + esc(r.src ? r.src.slot : '') + ', 시각 차이 ' + (r.src && r.src.gap_min != null ? Math.abs(r.src.gap_min) : '') + '분, ' + esc(r.src ? ({ 'same weekday': '같은 요일의 기록', 'other dates of the type': '같은 유형의 다른 날짜 기록' }[r.src.scope] || '') : '') + ')의 실제 기록 ' + pd + '을 참고했어요. 그 날짜들의 값을 한 번씩만 썼고 이 대표편의 관측 날짜 수에는 넣지 않았어요.</div>';
-    else if (r.mode === 'x') h += '<div class="small">예상 인원·색: 쓸 수 있는 기준 차종 기록이 없어 계산하지 않았어요.</div>';
+    else if (r.mode === 'f') h += '<div class="small">예상 인원·색: ' + pd + ' · 이 중 ' + (agg.Fcsv || 0) + '건: F 없음 → 2025년 승하차 통계 기반 추정 F (관측·다음 정류장 연결값 아님)</div>';
+    else if (r.mode === 'b') h += '<div class="small"><b>보완</b> 예상 인원·색: 선택한 요일 기준 차종 기록 없음 → 같은 배차 유형 다른 날짜 ' + pd + '의 같은 대표편·같은 차종 기록 참고 (관측 날짜 수 제외)</div>';
+    else if (r.mode === 'n') h += '<div class="small"><b>보완</b> 예상 인원·색: 동일 운행의 앞뒤 기록 기반 보완값 (' + pd + ', 관측 날짜 수 제외)</div>';
+    else if (r.mode === 'c') h += '<div class="small"><b>보완</b> 예상 인원·색: 같은 정류장·배차 유형·차종에서 가장 가까운 시각의 대표편(' + esc(r.src ? r.src.slot : '') + ', 시각 차이 ' + (r.src && r.src.gap_min != null ? Math.abs(r.src.gap_min) : '') + '분, ' + esc(r.src ? ({ 'same weekday': '같은 요일의 기록', 'other dates of the type': '같은 유형의 다른 날짜 기록' }[r.src.scope] || '') : '') + ')의 실제 기록 ' + pd + ' 참고 (날짜별 한 번씩만 사용, 이 대표편의 관측 날짜 수 제외)</div>';
+    else if (r.mode === 'x') h += '<div class="small">예상 인원·색: 기준 차종 기록 없음 (계산 불가)</div>';
     return h + '</div>';      // the excluded other-deck dates stay in the data (ref.other_capacity) and in the analysis files; the drawer no longer prints them
   }
   function sname(o) { var x = stopByOrder(o); return x ? x.name : o + '번'; }
@@ -690,22 +681,22 @@
       var facts = '';
       if (ref) {
         var pd = ref.people_dates || [], td = ref.time_dates || [], borrowed = ['b', 'n', 'c'].indexOf(ref.mode) >= 0;
-        if (ref.mode === 'x') facts += '<li>인원·색을 계산할 기록이 없어요</li>';
+        if (ref.mode === 'x') facts += '<li>인원·색: 계산할 기록 없음</li>';
         else if (borrowed) {   // same frame as an observed cell; the dates themselves are in "어떻게 계산했나요?"
-          facts += '<li>참고 기록 <b>다른 날짜 보완값 사용</b></li><li>' + (td.length ? '인원·색은 ' : '') + '선택한 요일의 직접 관측 기록 없음</li>'; plus = true;
+          facts += '<li>참고 기록 <b>다른 날짜 보완값 사용</b></li><li>' + (td.length ? '인원·색: ' : '') + '선택한 요일 직접 관측 기록 없음</li>'; plus = true;
           if (td.length) facts += '<li>시각 근거 <b>' + td.length + '일</b></li>';
-          else if (!hasT) facts += '<li>시각은 시연용 보완값이에요</li>';
+          else if (!hasT) facts += '<li>시각: 과거 기록 기반 보완값</li>';
         }
         else {
           var K = r ? r[2] : null;
           facts += '<li>참고 기록 <b>' + pd.length + '일</b>' + (K != null && K !== pd.length ? ' · ' + K + '건' : '') + '</li>';
           if (td.length && !sameSet(td, pd)) facts += '<li>시각 근거 <b>' + td.length + '일</b></li>';
-          if (!td.length && !hasT) facts += '<li>시각은 시연용 보완값이에요</li>';
+          if (!td.length && !hasT) facts += '<li>시각: 과거 기록 기반 보완값</li>';
         }
         facts += '<li>기준 차종 <b>' + (ref.C === 70 ? '2층 70석' : (ref.C ? '일반 ' + ref.C + '석' : '미정')) + '</b></li>';
       }
       if (facts) h += '<ul class="dfacts">' + facts + '</ul>';
-      h += '<div class="dnote">시연용 추정' + (plus ? ' <span class="plus">＋ 보완값 사용</span>' : '') + ((gc && (gc.c || gc.p)) ? ' <span class="plus">◆ 해석 주의</span>' : '') + '</div>';
+      h += '<div class="dnote">과거 기록 기반 추정' + (plus ? ' <span class="plus">＋ 보완값 사용</span>' : '') + ((gc && (gc.c || gc.p)) ? ' <span class="plus">◆ 해석 주의</span>' : '') + '</div>';
     }
     // minimal evidence + the shared explanation
     var ev = '';
@@ -722,15 +713,15 @@
     var el = $('#settings'), m = state.meta;
     var dates = Object.keys(m.date_info).sort(), routes = m.routes.map(function (r) { return r.id; }).join('·');
     var groups = m.day_groups.map(function (g) { return g.id + ' ' + (g.dates.length ? g.dates.length + '일' : '기록 없음'); }).join(' · ');
-    var sat = hasData('토') ? '공휴일이 아닌 토요일 기록 ' + typeDates('토').length + '일' : '공휴일이 아닌 토요일 기록은 아직 없어요';
+    var sat = hasData('토') ? '공휴일이 아닌 토요일 기록 ' + typeDates('토').length + '일' : '공휴일이 아닌 토요일 기록 없음';
     el.innerHTML =
       '<div class="panel"><button class="btn" id="btn-back">← 돌아가기</button><h2 style="margin-top:8px">설정·안내</h2></div>' +
       '<div class="panel"><h2>서비스 소개</h2><p>과거 버스 기록으로 정류장별 승차 여유를 비교하고, 공식 도착정보로 지금 오는 버스를 확인하는 서비스입니다.</p></div>' +
       keyPanelHtml() +
-      '<div class="panel"><h2>자료</h2><ul class="plain"><li>대상: ' + esc(routes) + ' (동탄→서울, 서울→동탄)</li><li>과거 기록: ' + esc(dates[0]) + ' ~ ' + esc(dates[dates.length - 1]) + ' (달력상 ' + dates.length + '일 범위이고 요일마다 기록 일수가 달라요)</li><li>예시 보기의 도착정보는 가상 예시이며, 예상 승차 여유는 과거 기록 기반 시연용 추정입니다.</li>' +
-      '<li>승하차 인원 참고값: 경기도 공공데이터(공공데이터포털, 이용허락범위 제한 없음)를 가공했어요.</li><li>버스 도착·잔여석 기록: 경기버스정보(GBIS) 과거 도착정보를 가공한 시연용 자료예요.</li><li>배차 정보: 운수회사 배차표를 노선·차종 대응에 참고했어요.</li>' +
-      '<li>요일별 기록: ' + esc(groups) + ' (요일마다 기록이 적어 참고용이에요)</li><li>일·공휴일은 공휴일과 일요일을 묶은 시연용 집계예요. ' + esc(sat) + '.</li></ul></div>' +
-      '<div class="panel"><h2>참고</h2><ul class="plain"><li>\'예시 보기\'의 도착정보는 가상 시나리오이고, \'실시간 조회\'는 경기도 버스도착정보 API의 응답입니다.</li><li>예상값은 실제 탑승을 보장하지 않습니다.</li><li>실시간 조회의 \'현재 빈자리\'는 조회 시점의 값이고 \'예상 승차 여유\'는 과거 기록에서 계산한 값입니다. 과거 참고편은 같은 버스가 아니라 도착 시각이 가장 가까운 대표편입니다.</li><li>실시간 조회는 화면이 열려 있는 동안 1분마다 자동 갱신하며, 탭이 숨겨지거나 10분 이상 조작이 없으면 멈춥니다.</li><li>자료 제공기관은 TAGOPA의 예상 결과와 무관하며 이를 보증하지 않습니다.</li><li>차량 정원과 승하차 인원은 시연용 가정이에요.</li></ul></div>' +
+      '<div class="panel"><h2>자료</h2><ul class="plain"><li>대상: ' + esc(routes) + ' (동탄→서울, 서울→동탄)</li><li>과거 기록: ' + esc(dates[0]) + ' ~ ' + esc(dates[dates.length - 1]) + ' (달력상 ' + dates.length + '일 범위 · 요일별 기록 일수 상이)</li><li>예시 보기: 가상 예시 도착정보 · 예상 승차 여유: 과거 기록 기반 추정</li>' +
+      '<li>승하차 인원 참고값: 경기도 공공데이터(공공데이터포털, 이용허락범위 제한 없음) 가공</li><li>버스 도착·잔여석 기록: 경기버스정보(GBIS) 과거 도착정보 가공 자료</li><li>배차 정보: 운수회사 배차표 (노선·차종 대응 참고)</li>' +
+      '<li>요일별 기록: ' + esc(groups) + ' (기록 일수가 적어 참고용)</li><li>일·공휴일: 일요일·공휴일 통합 집계</li><li>' + esc(sat) + '</li></ul></div>' +
+      '<div class="panel"><h2>참고</h2><ul class="plain"><li>\'예시 보기\'의 도착정보는 가상 시나리오이고, \'실시간 조회\'는 경기도 버스도착정보 API의 응답입니다.</li><li>예상값은 실제 탑승을 보장하지 않습니다.</li><li>실시간 조회의 \'현재 빈자리\'는 조회 시점의 값이고 \'예상 승차 여유\'는 과거 기록에서 계산한 값입니다. 과거 참고편은 같은 버스가 아니라 도착 시각이 가장 가까운 대표편입니다.</li><li>실시간 조회는 화면이 열려 있는 동안 1분마다 자동 갱신하며, 탭이 숨겨지거나 10분 이상 조작이 없으면 멈춥니다.</li><li>자료 제공기관은 TAGOPA의 예상 결과와 무관하며 이를 보증하지 않습니다.</li><li>기준 차종: 관측 기록과 배차표를 참고한 집계 기준(정원)</li><li>예상 승하차 인원(A·B): 2025년 승하차 공공데이터 기반 추정값</li></ul></div>' +
       '';
   }
   function keyPanelHtml() {
@@ -779,7 +770,7 @@
   // ---------------------------------------------------------------- render all and events
   function renderAll() { renderControls(); renderCard(); renderStats(); renderDetail(); }
   function setStop(order) {
-    state.stop = order; state.hl = null; state.banner = null; refreshBuses(); savePrefs(); renderCard(); renderStats();
+    state.stop = order; state.hl = null; refreshBuses(); savePrefs(); renderCard(); renderStats();
     prefetchBusGrids();
     var row = document.querySelector('#grid tr.mine'), sc = $('#grid-scroll');
     if (row && sc) {
@@ -798,7 +789,7 @@
     var row = document.querySelector('#grid tr.mine');
     if (row) sc.scrollTop = Math.max(0, row.offsetTop - headH() - 42);
   }
-  function resetAfterSelectionChange() { state.hl = null; state.banner = null; state.detail = null; state.detailOpen = false; state.showAll = false; state.showIncomplete = false; state.showMore = false; refreshBuses(); savePrefs(); }
+  function resetAfterSelectionChange() { state.hl = null; state.detail = null; state.detailOpen = false; state.showAll = false; state.showIncomplete = false; state.showMore = false; refreshBuses(); savePrefs(); }
   function bind() {
     $('#sel-route').addEventListener('change', function (e) {
       state.trial.custom = true; state.route = e.target.value; state.dir = routeMeta().directions[0].id; state.stop = defaultStop(); resetAfterSelectionChange(); renderAll();
@@ -810,7 +801,7 @@
     });
     $('#types').addEventListener('click', function (e) {
       var b = e.target.closest('.seg'); if (!b) return;
-      state.type = b.getAttribute('data-type'); state.banner = null; state.hl = null; state.detail = null; state.detailOpen = false; state.showAll = false; state.showIncomplete = false; state.showMore = false;
+      state.type = b.getAttribute('data-type'); state.hl = null; state.detail = null; state.detailOpen = false; state.showAll = false; state.showIncomplete = false; state.showMore = false;
       renderStats(); renderDetail(); loadViewAndRender().then(scrollToDefault);       // the top card (real-time) is NOT changed by browsing the table
     });
     $('#colinfo').addEventListener('click', function (e) {
@@ -818,11 +809,6 @@
       if (id === 'btn-more') { state.showMore = !state.showMore; if (!state.showMore) { state.showAll = false; state.showIncomplete = false; } renderColInfo(); renderGrid(); return; }   // folding returns to the default table
       if (id === 'btn-showinc') { state.showIncomplete = !state.showIncomplete; renderColInfo(); renderGrid(); return; }
       if (id === 'btn-showall') { state.showAll = !state.showAll; renderColInfo(); renderGrid(); }
-    });
-    $('#banner').addEventListener('click', function (e) {
-      if (e.target.id !== 'btn-undo') return;
-      state.type = state.banner.undo.type; state.banner = null; state.hl = null; state.detail = null; state.detailOpen = false;
-      renderStats(); renderDetail(); loadViewAndRender();
     });
     $('#card').addEventListener('click', function (e) {
       var md = e.target.closest('[data-mode]');
