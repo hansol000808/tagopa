@@ -601,10 +601,9 @@
   function headH() { var th = document.querySelector('#grid thead th'); return th ? th.offsetHeight : 40; }      // sticky header height (the grid header holds no time, only the 2층/중간출발 marks)
   function renderLegend() {
     var sw = ['r', 'o', 'y', 'g'].map(function (k) { return '<div class="lg"><i class="sw q-' + k + '"></i><span><b>' + QC[k].name + '</b></span></div>'; }).join('');
-    $('#legend').innerHTML = '<div class="lgrid">' + sw + '</div>' +
-      '<details class="how"><summary>어떻게 계산했나요?</summary>' + calcHtml() + '</details>';
+    $('#legend').innerHTML = '<div class="lgrid">' + sw + '</div>';
   }
-  function calcHtml(evHtml) {   // the ONE explanation (below the table, in the cell detail and in 설정·안내); concept only, details stay in the analysis documents
+  function calcHtml(evHtml) {   // the ONE explanation, shown only in the cell detail drawer ("어떻게 계산했나요?"); concept only, details stay in the analysis documents
     var sw = function (k) { return '<span class="sw q-' + k + '"></span>' + QC[k].name; };
     return '<div class="calc">' + (evHtml || '') +
       '<div class="cs"><b>승차 여유 계산</b><p class="fm">R = V + A</p><p class="fm">F = R − B</p>' +
@@ -619,6 +618,22 @@
   }
 
   // ---------------------------------------------------------------- detail (loaded per representative run, on demand)
+  function dlist(a) { return (a || []).map(function (x) { var p = x.split('-'); return parseInt(p[1], 10) + '/' + parseInt(p[2], 10); }).join(', '); }
+  function refHtml(agg, group, slot) {
+    var r = agg && agg.ref;
+    if (!r) return '';
+    var deck = r.C ? (r.C === 70 ? '2층 70석' : '일반 45석') : '미정';
+    var h = '<div class="refdeck"><b>기준 차종 ' + deck + '</b> <span class="small">(시연 기준 · 실제 버스 차종을 읽은 값이 아니에요)</span><div class="small">시각: ' + (r.time_dates.length ? (r.time_policy === 'r' ? '직접 관측한 기준 차종 기록 ' : '직접 관측한 모든 차종 기록 ') + r.time_dates.length + '일(' + esc(dlist(r.time_dates)) + ')' : '선택한 요일에 직접 관측한 시각 없음 — 표의 시각은 시연용 보완값(＋)') + '</div>';
+    var pd = r.people_dates.length + '일(' + esc(dlist(r.people_dates)) + ')';
+    if (r.mode === 's') h += '<div class="small">예상 인원·색: ' + TYPE_LABEL[group] + ' 기준 차종 기록 ' + pd + '</div>';
+    else if (r.mode === 'f') h += '<div class="small">예상 인원·색: ' + TYPE_LABEL[group] + ' 기준 차종 기록 ' + pd + ' · 이 중 ' + (agg.Fcsv || 0) + '건은 F가 없어 CSV 참고 합성 F를 썼어요(관측·다음 정류장 연결값이 아니에요).</div>';
+    else if (r.mode === 'b') h += '<div class="small"><b>보완</b> 예상 인원·색: 이 요일에 기준 차종의 쓸 수 있는 기록이 없어 같은 배차 유형의 다른 날짜 ' + pd + '의 같은 대표편·같은 차종 기록을 참고했어요. 관측 날짜 수에는 넣지 않았어요.</div>';
+    else if (r.mode === 'n') h += '<div class="small"><b>보완</b> 예상 인원·색: 같은 운행의 앞뒤 기록으로 만든 시연용 값(' + pd + ')이에요. 관측 날짜 수에는 넣지 않았어요.</div>';
+    else if (r.mode === 'c') h += '<div class="small"><b>보완</b> 예상 인원·색: 같은 정류장·배차 유형·차종에서 가장 가까운 시각의 대표편(' + esc(r.src ? r.src.slot : '') + ', 시각 차이 ' + (r.src && r.src.gap_min != null ? Math.abs(r.src.gap_min) : '') + '분, ' + esc(r.src ? ({ 'same weekday': '같은 요일의 기록', 'other dates of the type': '같은 유형의 다른 날짜 기록' }[r.src.scope] || '') : '') + ')의 실제 기록 ' + pd + '을 참고했어요. 그 날짜들의 값을 한 번씩만 썼고 이 대표편의 관측 날짜 수에는 넣지 않았어요.</div>';
+    else if (r.mode === 'x') h += '<div class="small">예상 인원·색: 쓸 수 있는 기준 차종 기록이 없어 계산하지 않았어요.</div>';
+    if (r.other_capacity.length) h += '<div class="small">' + (r.time_policy === 'r' ? '다른 차종이라 인원·색과 시각에서 제외(원본은 그대로): ' : '다른 차종이라 인원·색에서 제외(시각에는 사용, 원본은 그대로): ') + r.other_capacity.map(function (o) { return esc(o.d.slice(5)) + ' ' + o.C + '석'; }).join(', ') + '</div>';
+    return h + '</div>';
+  }
   function sname(o) { var x = stopByOrder(o); return x ? x.name : o + '번'; }
   function isDesk() { return window.matchMedia('(min-width: 1000px)').matches; }
   function syncScrim() { var sc = $('#scrim'); if (sc) sc.hidden = !(isDesk() && state.detail && state.detailOpen); }
@@ -677,11 +692,15 @@
       if (ref) {
         var pd = ref.people_dates || [], td = ref.time_dates || [], borrowed = ['b', 'n', 'c'].indexOf(ref.mode) >= 0;
         if (ref.mode === 'x') facts += '<li>인원·색을 계산할 기록이 없어요</li>';
-        else if (borrowed) { facts += '<li>이 요일 관측 기록 없음 · 보완값 참고' + (pd.length ? ' (' + datesTxt(pd) + ')' : '') + '</li>'; plus = true; if (td.length) facts += '<li>시각 관측 <b>' + td.length + '일</b> (' + datesTxt(td) + ')</li>'; }
+        else if (borrowed) {   // same frame as an observed cell; the dates themselves are in "어떻게 계산했나요?"
+          facts += '<li>참고 기록 <b>다른 날짜 보완값 사용</b></li><li>' + (td.length ? '인원·색은 ' : '') + '선택한 요일의 직접 관측 기록 없음</li>'; plus = true;
+          if (td.length) facts += '<li>시각 근거 <b>' + td.length + '일</b></li>';
+          else if (!hasT) facts += '<li>시각은 시연용 보완값이에요</li>';
+        }
         else {
           var K = r ? r[2] : null;
-          facts += '<li>참고 기록 <b>' + pd.length + '일</b> (' + datesTxt(pd) + ')' + (K != null && K !== pd.length ? ' · ' + K + '건' : '') + '</li>';
-          if (td.length && !sameSet(td, pd)) facts += '<li>시각은 <b>' + td.length + '일</b> (' + datesTxt(td) + ') 기록 기준</li>';
+          facts += '<li>참고 기록 <b>' + pd.length + '일</b>' + (K != null && K !== pd.length ? ' · ' + K + '건' : '') + '</li>';
+          if (td.length && !sameSet(td, pd)) facts += '<li>시각 근거 <b>' + td.length + '일</b></li>';
           if (!td.length && !hasT) facts += '<li>시각은 시연용 보완값이에요</li>';
         }
         facts += '<li>기준 차종 <b>' + (ref.C === 70 ? '2층 70석' : (ref.C ? '일반 ' + ref.C + '석' : '미정')) + '</b></li>';
@@ -691,7 +710,8 @@
     }
     // minimal evidence + the shared explanation
     var ev = '';
-    if (q) ev += '<div class="cs ev1"><b>이 칸의 분류</b><div>R 중앙값 <b>' + num(q[1], 1) + '명</b> → ' + (q[1] < 10 ? '10명 미만' : '10명 이상') + '</div><div>F 4석 이하 <b>' + q[5] + '/' + q[4] + '건</b> → q ' + (q[5] / q[4] >= 1 / 3 ? '≥' : '<') + ' 1/3</div><div>→ <span class="dq q-' + q[0] + '"><b>' + QC[q[0]].name + '</b></span></div></div>';
+    if (ref) ev += refHtml(agg, d.type, slot);      // dates behind the number / colour and behind the time, reference deck, supplement mode (moved here from the top of the drawer)
+    if (q) ev +='<div class="cs ev1"><b>이 칸의 분류</b><div>R 중앙값 <b>' + num(q[1], 1) + '명</b> → ' + (q[1] < 10 ? '10명 미만' : '10명 이상') + '</div><div>F 4석 이하 <b>' + q[5] + '/' + q[4] + '건</b> → q ' + (q[5] / q[4] >= 1 / 3 ? '≥' : '<') + ' 1/3</div><div>→ <span class="dq q-' + q[0] + '"><b>' + QC[q[0]].name + '</b></span></div></div>';
     if (r || q || hasT) h += '<details class="evid"><summary>어떻게 계산했나요?</summary>' + calcHtml(ev) + '</details>';
     el.innerHTML = h;
     el.scrollTop = 0;
@@ -708,10 +728,9 @@
       '<div class="panel"><button class="btn" id="btn-back">← 돌아가기</button><h2 style="margin-top:8px">설정·안내</h2></div>' +
       '<div class="panel"><h2>서비스 소개</h2><p>과거 버스 기록으로 정류장별 승차 여유를 비교하고, 공식 도착정보로 지금 오는 버스를 확인하는 서비스입니다.</p></div>' +
       keyPanelHtml() +
-      '<div class="panel"><h2>자료</h2><ul class="plain"><li>대상: ' + esc(routes) + ' (동탄→서울, 서울→동탄)</li><li>과거 기록: ' + esc(dates[0]) + ' ~ ' + esc(dates[dates.length - 1]) + '</li><li>예시 보기의 도착정보는 가상 예시이며, 예상 승차 여유는 과거 기록 기반 시연용 추정입니다.</li>' +
+      '<div class="panel"><h2>자료</h2><ul class="plain"><li>대상: ' + esc(routes) + ' (동탄→서울, 서울→동탄)</li><li>과거 기록: ' + esc(dates[0]) + ' ~ ' + esc(dates[dates.length - 1]) + ' (달력상 ' + dates.length + '일 범위이고 요일마다 기록 일수가 달라요)</li><li>예시 보기의 도착정보는 가상 예시이며, 예상 승차 여유는 과거 기록 기반 시연용 추정입니다.</li>' +
       '<li>승하차 인원 참고값: 경기도 공공데이터(공공데이터포털, 이용허락범위 제한 없음)를 가공했어요.</li><li>버스 도착·잔여석 기록: 경기버스정보(GBIS) 과거 도착정보를 가공한 시연용 자료예요.</li><li>배차 정보: 운수회사 배차표를 노선·차종 대응에 참고했어요.</li>' +
       '<li>요일별 기록: ' + esc(groups) + ' (요일마다 기록이 적어 참고용이에요)</li><li>일·공휴일은 공휴일과 일요일을 묶은 시연용 집계예요. ' + esc(sat) + '.</li></ul></div>' +
-      '<div class="panel"><h2>계산 방법</h2>' + calcHtml() + '</div>' +
       '<div class="panel"><h2>참고</h2><ul class="plain"><li>\'예시 보기\'의 도착정보는 가상 시나리오이고, \'실시간 조회\'는 경기도 버스도착정보 API의 응답입니다.</li><li>예상값은 실제 탑승을 보장하지 않습니다.</li><li>실시간 조회의 \'현재 빈자리\'는 조회 시점의 값이고 \'예상 승차 여유\'는 과거 기록에서 계산한 값입니다. 과거 참고편은 같은 버스가 아니라 도착 시각이 가장 가까운 대표편입니다.</li><li>실시간 조회는 화면이 열려 있는 동안 1분마다 자동 갱신하며, 탭이 숨겨지거나 10분 이상 조작이 없으면 멈춥니다.</li><li>자료 제공기관은 TAGOPA의 예상 결과와 무관하며 이를 보증하지 않습니다.</li><li>차량 정원과 승하차 인원은 시연용 가정이에요.</li></ul></div>' +
       '';
   }
